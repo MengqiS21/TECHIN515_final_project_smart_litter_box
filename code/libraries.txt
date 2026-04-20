@@ -1,0 +1,7 @@
+# Required Arduino Libraries
+# Install these via Arduino IDE: Tools > Manage Libraries
+
+HX711_ADC by Olav Kallhovd (latest version)
+
+# Built-in libraries (no installation needed):
+# EEPROM  — included with ESP32 Arduino core
