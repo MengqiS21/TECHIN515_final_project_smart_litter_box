@@ -1,9 +1,12 @@
 /*
  * ============================================
  *  Smart Cat Litter Box Monitor
- *  Step 2: PIR Auto-Capture (Interrupt Version)
+ *  Step 2: PIR Auto-Capture (Polling + Re-init)
  *  Board: XIAO ESP32S3 Sense
  * ============================================
+ *
+ *  Uses polling with periodic GPIO re-init to keep
+ *  PIR detection stable alongside the camera driver.
  */
 
 #include "esp_camera.h"
@@ -30,25 +33,24 @@
 #define PCLK_GPIO_NUM     13
 
 #define SD_CS_PIN         21
-#define PIR_PIN           1    // D0 (GPIO 1) - change if you use a different pin
+#define PIR_PIN           1    // D0 (GPIO 1)
 
 #define BURST_COUNT       3
 #define BURST_INTERVAL    800
-#define COOLDOWN_TIME     30000
-#define PIR_WARMUP_TIME   15000   // 15 seconds warmup for stability
+#define COOLDOWN_TIME     10000
+#define PIR_WARMUP_TIME   15000
+
+// How often to re-init the PIR GPIO (prevents drift)
+#define PIR_REINIT_INTERVAL  60000  // every 60 seconds
 
 // Global variables
 int photoCount = 0;
 unsigned long lastTriggerTime = 0;
+unsigned long lastPirReinit = 0;
 int triggerCount = 0;
 
-// Interrupt flag - volatile because modified in ISR
-volatile bool motionDetected = false;
-
-// ISR - keep it minimal
-void IRAM_ATTR onMotion() {
-  motionDetected = true;
-}
+// Track PIR state for edge detection
+int lastPirState = LOW;
 
 bool initCamera() {
   camera_config_t config;
@@ -174,13 +176,20 @@ void burstCapture() {
                 success, BURST_COUNT, photoCount);
 }
 
+void initPIR() {
+  pinMode(PIR_PIN, INPUT);
+  lastPirState = digitalRead(PIR_PIN);
+  lastPirReinit = millis();
+  Serial.println("[PIR] GPIO re-initialized");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
   Serial.println("=========================================");
   Serial.println("  Smart Cat Litter Box Monitor");
-  Serial.println("  Step 2: PIR Auto-Capture (Interrupt)");
+  Serial.println("  Step 2: PIR Auto-Capture (Polling)");
   Serial.println("=========================================\n");
 
   if (!initCamera()) {
@@ -193,16 +202,15 @@ void setup() {
     while (true) delay(1000);
   }
 
-  // Setup PIR with interrupt
-  pinMode(PIR_PIN, INPUT);
-  
+  // Setup PIR AFTER camera init
+  initPIR();
+
   // PIR warmup
   Serial.printf("[PIR] Warming up (%d seconds)...\n", PIR_WARMUP_TIME / 1000);
   delay(PIR_WARMUP_TIME);
 
-  // Attach interrupt AFTER warmup to avoid false triggers
-  attachInterrupt(digitalPinToInterrupt(PIR_PIN), onMotion, RISING);
-  Serial.println("[PIR] Interrupt attached on GPIO " + String(PIR_PIN));
+  // Read initial state after warmup
+  lastPirState = digitalRead(PIR_PIN);
 
   Serial.println("\n[Ready] System armed! Waiting for cat...\n");
   Serial.println("  Burst count:  " + String(BURST_COUNT) + " photos per trigger");
@@ -221,13 +229,20 @@ void loop() {
     }
   }
 
-  // Check interrupt flag
-  if (motionDetected) {
-    motionDetected = false;  // Reset flag
+  // Periodically re-init PIR GPIO to prevent drift
+  if (millis() - lastPirReinit > PIR_REINIT_INTERVAL) {
+    initPIR();
+  }
+
+  // PIR polling with edge detection (LOW -> HIGH = new motion)
+  int currentPirState = digitalRead(PIR_PIN);
+
+  if (currentPirState == HIGH && lastPirState == LOW) {
+    // Rising edge detected
     unsigned long now = millis();
 
     if (now - lastTriggerTime > COOLDOWN_TIME) {
-      Serial.println("[PIR] Motion detected via interrupt!");
+      Serial.println("[PIR] Motion detected!");
       burstCapture();
       lastTriggerTime = now;
     } else {
@@ -235,5 +250,6 @@ void loop() {
     }
   }
 
-  delay(100);
+  lastPirState = currentPirState;
+  delay(50);  // Poll every 50ms
 }
