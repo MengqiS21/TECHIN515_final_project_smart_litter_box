@@ -1,28 +1,9 @@
 /*
  * ============================================
  *  Smart Cat Litter Box Monitor
- *  Step 2: PIR Auto-Capture Sketch
+ *  Step 2: PIR Auto-Capture (Interrupt Version)
  *  Board: XIAO ESP32S3 Sense
  * ============================================
- *
- *  功能：
- *  1. PIR 传感器检测到运动 → 自动拍照
- *  2. 每次触发连拍 3 张（提高有效照片率）
- *  3. 照片存到 SD 卡，文件名自动递增
- *  4. 冷却期防止重复触发（同一只猫一次上厕所只拍一组）
- *  5. Serial 打印拍照日志
- *
- *  硬件接线：
- *  - PIR 传感器:
- *      VCC  → 3.3V
- *      GND  → GND
- *      OUT  → D2 (GPIO 3)
- *  - 摄像头和 SD 卡用扩展板自带的，不用接线
- *
- *  采集策略：
- *  - 让设备在猫砂盆旁跑 3-5 天
- *  - 之后取出 SD 卡，人工分类照片到 cat_a/ 和 cat_b/ 文件夹
- *  - 每只猫目标 150-200 张有效照片
  */
 
 #include "esp_camera.h"
@@ -30,11 +11,7 @@
 #include "SD.h"
 #include "SPI.h"
 
-// ============================================
-//  引脚定义
-// ============================================
-
-// XIAO ESP32S3 Sense 摄像头引脚
+// XIAO ESP32S3 Sense camera pins
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM     10
@@ -52,30 +29,27 @@
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
-// SD 卡
 #define SD_CS_PIN         21
+#define PIR_PIN           1    // D0 (GPIO 1) - change if you use a different pin
 
-// PIR 传感器
-#define PIR_PIN           3    // D2 on XIAO ESP32S3
+#define BURST_COUNT       3
+#define BURST_INTERVAL    800
+#define COOLDOWN_TIME     30000
+#define PIR_WARMUP_TIME   15000   // 15 seconds warmup for stability
 
-// ============================================
-//  配置参数（可以根据实际情况调整）
-// ============================================
-#define BURST_COUNT       3        // 每次触发连拍几张
-#define BURST_INTERVAL    800      // 连拍间隔 (ms)，给猫时间换姿势
-#define COOLDOWN_TIME     30000    // 冷却期 (ms)，防止同一次上厕所重复拍
-#define PIR_WARMUP_TIME   10000    // PIR 传感器预热时间 (ms)
-
-// ============================================
-//  全局变量
-// ============================================
+// Global variables
 int photoCount = 0;
 unsigned long lastTriggerTime = 0;
-int triggerCount = 0;  // 总触发次数
+int triggerCount = 0;
 
-// ============================================
-//  初始化摄像头
-// ============================================
+// Interrupt flag - volatile because modified in ISR
+volatile bool motionDetected = false;
+
+// ISR - keep it minimal
+void IRAM_ATTR onMotion() {
+  motionDetected = true;
+}
+
 bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -105,7 +79,7 @@ bool initCamera() {
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 
   if (psramFound()) {
-    config.frame_size   = FRAMESIZE_VGA;   // 640x480
+    config.frame_size   = FRAMESIZE_VGA;
     config.jpeg_quality = 10;
     config.fb_count     = 2;
     Serial.println("[Camera] PSRAM found, using VGA (640x480)");
@@ -122,9 +96,6 @@ bool initCamera() {
   return true;
 }
 
-// ============================================
-//  初始化 SD 卡
-// ============================================
 bool initSD() {
   if (!SD.begin(SD_CS_PIN)) {
     Serial.println("[SD] Mount FAILED!");
@@ -137,12 +108,10 @@ bool initSD() {
     return false;
   }
 
-  // 读取已有照片数量，从最大编号继续（防止重启后覆盖）
   File root = SD.open("/");
   while (File entry = root.openNextFile()) {
     String name = entry.name();
     if (name.startsWith("img_") && name.endsWith(".jpg")) {
-      // 从文件名 "img_00042.jpg" 提取数字 42
       int num = name.substring(4, 9).toInt();
       if (num > photoCount) {
         photoCount = num;
@@ -158,9 +127,6 @@ bool initSD() {
   return true;
 }
 
-// ============================================
-//  拍一张照片并保存
-// ============================================
 bool captureAndSave() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
@@ -189,9 +155,6 @@ bool captureAndSave() {
   return true;
 }
 
-// ============================================
-//  连拍一组照片
-// ============================================
 void burstCapture() {
   triggerCount++;
   Serial.printf("\n=== Trigger #%d | Taking %d photos ===\n",
@@ -203,7 +166,7 @@ void burstCapture() {
       success++;
     }
     if (i < BURST_COUNT - 1) {
-      delay(BURST_INTERVAL);  // 连拍间隔
+      delay(BURST_INTERVAL);
     }
   }
 
@@ -211,37 +174,35 @@ void burstCapture() {
                 success, BURST_COUNT, photoCount);
 }
 
-// ============================================
-//  Setup
-// ============================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
   Serial.println("=========================================");
   Serial.println("  Smart Cat Litter Box Monitor");
-  Serial.println("  Step 2: PIR Auto-Capture");
+  Serial.println("  Step 2: PIR Auto-Capture (Interrupt)");
   Serial.println("=========================================\n");
 
-  // 初始化摄像头
   if (!initCamera()) {
     Serial.println("[FATAL] Camera init failed!");
     while (true) delay(1000);
   }
 
-  // 初始化 SD 卡
   if (!initSD()) {
     Serial.println("[FATAL] SD card init failed!");
     while (true) delay(1000);
   }
 
-  // 初始化 PIR
+  // Setup PIR with interrupt
   pinMode(PIR_PIN, INPUT);
-  Serial.println("[PIR] Pin configured");
-
-  // PIR 需要预热
+  
+  // PIR warmup
   Serial.printf("[PIR] Warming up (%d seconds)...\n", PIR_WARMUP_TIME / 1000);
   delay(PIR_WARMUP_TIME);
+
+  // Attach interrupt AFTER warmup to avoid false triggers
+  attachInterrupt(digitalPinToInterrupt(PIR_PIN), onMotion, RISING);
+  Serial.println("[PIR] Interrupt attached on GPIO " + String(PIR_PIN));
 
   Serial.println("\n[Ready] System armed! Waiting for cat...\n");
   Serial.println("  Burst count:  " + String(BURST_COUNT) + " photos per trigger");
@@ -249,11 +210,8 @@ void setup() {
   Serial.println("  Send 't' in Serial to test capture manually\n");
 }
 
-// ============================================
-//  Loop
-// ============================================
 void loop() {
-  // 手动触发（调试用）
+  // Manual trigger
   if (Serial.available() > 0) {
     char cmd = Serial.read();
     if (cmd == 't' || cmd == 'T') {
@@ -263,20 +221,19 @@ void loop() {
     }
   }
 
-  // PIR 检测
-  if (digitalRead(PIR_PIN) == HIGH) {
+  // Check interrupt flag
+  if (motionDetected) {
+    motionDetected = false;  // Reset flag
     unsigned long now = millis();
 
-    // 检查冷却期
     if (now - lastTriggerTime > COOLDOWN_TIME) {
-      Serial.println("[PIR] Motion detected!");
+      Serial.println("[PIR] Motion detected via interrupt!");
       burstCapture();
       lastTriggerTime = now;
     } else {
-      // 冷却期内，忽略
-      // (不打印，避免刷屏)
+      Serial.println("[PIR] Cooldown active, ignoring trigger");
     }
   }
 
-  delay(100);  // 检测间隔 100ms
+  delay(100);
 }
