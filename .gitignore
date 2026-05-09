@@ -1,0 +1,33 @@
+# ── Python ─────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.python-version
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ── Streamlit / local ─────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── OS / editor ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Large binaries (optional: remove line if you want this in Git / use Git LFS) ──
+data/*.zip
