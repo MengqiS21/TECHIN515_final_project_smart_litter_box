@@ -18,6 +18,8 @@ An IoT-enabled smart litter box that uses a load cell weight sensor to monitor c
 
 ## Wiring
 
+### HX711 (load cell amplifier)
+
 | HX711 Pin | XIAO ESP32-S3 Pin | GPIO |
 |-----------|-------------------|------|
 | DT (Data) | D3 | GPIO 4 |
@@ -26,6 +28,22 @@ An IoT-enabled smart litter box that uses a load cell weight sensor to monitor c
 | GND | GND | — |
 
 Connect the load cell's four wires to the HX711 module following the color convention printed on the HX711 board (typically: Red=E+, Black=E−, White=A−, Green=A+).
+
+### PIR motion sensor
+
+Typical 3-pin HC-SR501-style PIR module wiring to the XIAO ESP32-S3:
+
+| PIR Pin | XIAO ESP32-S3 Pin | GPIO |
+|---------|-------------------|------|
+| VCC | **3.3V** | — |
+| GND | **GND** | — |
+| OUT (digital signal) | **D3** | GPIO 4 |
+
+Power the PIR from **3.3 V** so its output levels are safe for the ESP32 GPIO. Use **`INPUT_PULLUP`** (or an external pull-up per your module datasheet) on the signal pin if your sketch expects an active-low/open-drain output.
+
+On the XIAO ESP32-S3, **D3** corresponds to **GPIO 4** — set `PIR_PIN` (or equivalent) in your sketch to **`4`** when using this wiring. The sample `code/PIR_data_capture.ino` may default to another pin; update it to match your board.
+
+**HX711 + PIR on one board:** One GPIO cannot be both HX711 **DT** and PIR **OUT**. If you keep PIR on **D3**, move HX711 **DT** to another free digital pin and update the DT pin in your weight-reading sketch so both peripherals can run together.
 
 ---
 
