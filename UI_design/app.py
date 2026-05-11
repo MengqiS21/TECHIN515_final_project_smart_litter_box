@@ -17,6 +17,7 @@ st.set_page_config(
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=swap');
 
   html, body, [class*="css"] {
     font-family: 'Nunito', sans-serif !important;
@@ -27,10 +28,17 @@ st.markdown("""
   /* Main background */
   .stApp { background-color: #FBFAF6; }
 
-  /* Hide Streamlit chrome: top bar (Running / Stop / Deploy / ⋮) */
+  /* Hide Streamlit chrome: top bar only */
   header[data-testid="stHeader"],
   div[data-testid="stToolbar"],
   div[data-testid="stDecoration"] {
+    display: none !important;
+  }
+
+  /* Hide sidebar collapse/expand buttons and broken icon text */
+  button[data-testid="stSidebarCollapseButton"],
+  [data-testid="stSidebarCollapsedControl"],
+  [data-testid="stIconMaterial"] {
     display: none !important;
   }
   /* Restore sensible top spacing once header is gone (main column only) */
@@ -361,37 +369,49 @@ st.divider()
 st.markdown('<div class="section-title">🐱 Cat Identification</div>', unsafe_allow_html=True)
 st.markdown('<div class="section-sub">ML model identifies which cat is using the box based on weight signature — placeholder data</div>', unsafe_allow_html=True)
 
-c1, c2 = st.columns([1, 2])
-with c1:
+ci1, ci2, ci3, ci4 = st.columns([1.2, 1, 1, 1])
+
+with ci1:
     st.markdown("""
-    <div style="text-align:center; padding-top:8px;">
-      <div class="cat-avatar" style="background:#7C6BB5; width:80px; height:80px; font-size:36px; margin:0 auto 10px;">🐱</div>
-      <div style="font-size:24px; font-weight:800; color:#2A2440;">Wesley</div>
-      <div style="font-size:13px; color:#7A7490; margin-top:4px;">Most Recent Visit</div>
-    </div>
-    """, unsafe_allow_html=True)
-with c2:
-    st.markdown("""
-    <div style="padding-top:10px;">
-      <div style="margin-bottom:10px;">
-        <span style="color:#7A7490; font-size:13px;">Detected Weight</span><br>
-        <span style="font-size:28px; font-weight:800; color:#7C6BB5;">4,312 g</span>
-      </div>
-      <div style="margin-bottom:10px;">
-        <span style="color:#7A7490; font-size:13px;">Confidence</span><br>
-        <span style="font-size:22px; font-weight:800; color:#2A2440;">92.4%</span>
-        <span class="confidence-badge">High</span>
-      </div>
+    <div style="display:flex; align-items:center; gap:14px; padding:12px 0;">
+      <div style="width:64px; height:64px; border-radius:50%; background:#7C6BB5;
+                  display:flex; align-items:center; justify-content:center;
+                  font-size:30px; flex-shrink:0;">🐱</div>
       <div>
-        <span style="color:#7A7490; font-size:13px;">Visit Time</span><br>
-        <span style="font-size:16px; font-weight:700; color:#2A2440;">10:32 AM · 3.2 min</span>
+        <div style="font-size:22px; font-weight:800; color:#2A2440; line-height:1.1;">Wesley</div>
+        <div style="font-size:12px; color:#7A7490; margin-top:3px;">Most Recent Visit</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-st.caption(
-    "Roster (placeholder): Wesley ~4.3 kg, Pupu ~4.7 kg · weight-based K-NN classifier."
-)
+with ci2:
+    st.markdown("""
+    <div style="padding:12px 0;">
+      <div style="font-size:12px; color:#7A7490; margin-bottom:4px;">Detected Weight</div>
+      <div style="font-size:28px; font-weight:800; color:#7C6BB5; line-height:1;">4,312 g</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with ci3:
+    st.markdown("""
+    <div style="padding:12px 0;">
+      <div style="font-size:12px; color:#7A7490; margin-bottom:4px;">Confidence</div>
+      <div style="font-size:28px; font-weight:800; color:#2A2440; line-height:1;">92.4%</div>
+      <span style="display:inline-block; background:#7C6BB5; color:#fff; border-radius:50px;
+                   padding:2px 12px; font-size:12px; font-weight:700; margin-top:4px;">High</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+with ci4:
+    st.markdown("""
+    <div style="padding:12px 0;">
+      <div style="font-size:12px; color:#7A7490; margin-bottom:4px;">Visit Time</div>
+      <div style="font-size:22px; font-weight:800; color:#2A2440; line-height:1.2;">10:32 AM</div>
+      <div style="font-size:14px; color:#7A7490; margin-top:4px;">Duration: 3.2 min</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+st.caption("Roster (placeholder): Wesley ~4.3 kg, Pupu ~4.7 kg · weight-based K-NN classifier.")
 
 st.divider()
 
