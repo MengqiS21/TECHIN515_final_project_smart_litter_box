@@ -166,72 +166,72 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Shared state (thread-safe deque) ─────────────────────────────────────────
-MAX_POINTS = 60  # 60 readings ≈ last 60 s at ~1 Hz
+# ── Shared state (cache_resource: survives Streamlit reruns) ──────────────────
+MAX_POINTS = 60
 
-if "weight_buf" not in st.session_state:
-    st.session_state.weight_buf = deque(maxlen=MAX_POINTS)
-if "time_buf" not in st.session_state:
-    st.session_state.time_buf = deque(maxlen=MAX_POINTS)
-if "connected" not in st.session_state:
-    st.session_state.connected = False
-if "serial_error" not in st.session_state:
-    st.session_state.serial_error = ""
-if "_reader_started" not in st.session_state:
-    st.session_state._reader_started = False
 
-# ── Serial reader thread ──────────────────────────────────────────────────────
-_stop_event = threading.Event()
-_serial_lock = threading.Lock()
+@st.cache_resource
+def get_state():
+    return {
+        "connected": False,
+        "serial_error": "",
+        "weight_buf": deque(maxlen=MAX_POINTS),
+        "time_buf": deque(maxlen=MAX_POINTS),
+        "lock": threading.Lock(),
+        "stop_event": threading.Event(),
+        "ser": None,
+    }
 
 
 def serial_reader(port: str, baud: int = 115200):
-    """Read lines from serial and parse: 'Load_cell output val: 203.19'"""
+    state = get_state()
     try:
         import serial  # type: ignore
     except ImportError:
-        with _serial_lock:
-            st.session_state.serial_error = "pyserial not installed."
+        with state["lock"]:
+            state["serial_error"] = "pyserial not installed."
         return
 
     ser = None
     try:
         ser = serial.Serial(port, baud, timeout=1)
-        with _serial_lock:
-            st.session_state.connected = True
-            st.session_state.serial_error = ""
+        with state["lock"]:
+            state["connected"] = True
+            state["serial_error"] = ""
+            state["ser"] = ser
 
-        while not _stop_event.is_set():
+        while not state["stop_event"].is_set():
             try:
                 raw = ser.readline().decode("utf-8", errors="ignore").strip()
                 if "val:" in raw:
                     val_str = raw.split("val:")[-1].strip()
                     value = float(val_str)
                     now = datetime.now()
-                    with _serial_lock:
-                        st.session_state.weight_buf.append(value)
-                        st.session_state.time_buf.append(now)
+                    with state["lock"]:
+                        state["weight_buf"].append(value)
+                        state["time_buf"].append(now)
             except (ValueError, UnicodeDecodeError):
                 pass
             except Exception:
                 break
 
     except Exception as e:
-        with _serial_lock:
-            st.session_state.connected = False
-            st.session_state.serial_error = str(e)
+        with state["lock"]:
+            state["connected"] = False
+            state["serial_error"] = str(e)
     finally:
         if ser and ser.is_open:
             ser.close()
-        with _serial_lock:
-            st.session_state.connected = False
+        with state["lock"]:
+            state["connected"] = False
+            state["ser"] = None
 
 
 def start_reader(port: str):
-    global _stop_event
-    _stop_event.set()          # stop any previous thread
+    state = get_state()
+    state["stop_event"].set()
     time.sleep(0.3)
-    _stop_event = threading.Event()
+    state["stop_event"].clear()
     t = threading.Thread(target=serial_reader, args=(port,), daemon=True)
     t.start()
 
@@ -295,19 +295,28 @@ with st.sidebar:
 
     if connect_btn:
         start_reader(port)
-        st.session_state._reader_started = True
 
     if disconnect_btn:
-        _stop_event.set()
-        st.session_state.connected = False
-        st.session_state._reader_started = False
+        state = get_state()
+        state["stop_event"].set()
+        with state["lock"]:
+            state["connected"] = False
 
-    with _serial_lock:
-        is_connected = st.session_state.connected
-        err_msg = st.session_state.serial_error
+    state = get_state()
+    with state["lock"]:
+        is_connected = state["connected"]
+        err_msg = state["serial_error"]
 
     if is_connected:
         st.markdown('<span class="dot-green">●</span> Connected', unsafe_allow_html=True)
+        tare_btn = st.button("⚖️ Tare (Zero)", use_container_width=True)
+        if tare_btn:
+            state = get_state()
+            with state["lock"]:
+                ser_obj = state["ser"]
+            if ser_obj and ser_obj.is_open:
+                ser_obj.write(b't')
+                st.toast("Tare command sent — scale zeroed!", icon="⚖️")
     else:
         st.markdown('<span class="dot-red">●</span> Disconnected', unsafe_allow_html=True)
         if err_msg:
@@ -391,7 +400,7 @@ st.markdown('<div class="section-title">📋 Visit History</div>', unsafe_allow_
 st.markdown('<div class="section-sub">Recent litter box visits — placeholder data</div>', unsafe_allow_html=True)
 
 history_df = make_visit_history()
-styled = history_df.style.applymap(visit_history_status_style, subset=["Status"])
+styled = history_df.style.map(visit_history_status_style, subset=["Status"])
 st.dataframe(
     styled,
     use_container_width=True,
@@ -467,42 +476,54 @@ for icon, ts, msg in alerts:
 
 # ── Live update loop ──────────────────────────────────────────────────────────
 while True:
-    with _serial_lock:
-        weights = list(st.session_state.weight_buf)
-        times = list(st.session_state.time_buf)
-        connected = st.session_state.connected
+    state = get_state()
+    with state["lock"]:
+        weights = list(state["weight_buf"])
+        times = list(state["time_buf"])
+        connected = state["connected"]
 
     if weights:
         current_w = weights[-1]
-        w_arr = np.array(weights)
+        valid = [w for w in weights if w >= 50]
 
-        # Big number
-        weight_num_slot.markdown(f"""
-        <div style="margin: 12px 0 6px;">
-          <span class="weight-number">{current_w:,.1f}</span>
-          <span class="weight-unit">g</span>
-        </div>
-        """, unsafe_allow_html=True)
+        # Big number — hide negative readings
+        if current_w < 50:
+            weight_num_slot.markdown("""
+            <div style="margin: 12px 0 6px;">
+              <span class="weight-number" style="color:#C4BDD8;">--</span>
+              <span class="weight-unit">g &nbsp;<span style="font-size:16px;color:#7A7490;">No load detected</span></span>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            weight_num_slot.markdown(f"""
+            <div style="margin: 12px 0 6px;">
+              <span class="weight-number">{current_w:,.1f}</span>
+              <span class="weight-unit">g</span>
+            </div>
+            """, unsafe_allow_html=True)
 
-        # Line chart
-        df_chart = pd.DataFrame({"Weight (g)": weights}, index=pd.to_datetime(times))
-        chart_slot.line_chart(
-            df_chart,
-            color=["#7C6BB5"],
-            use_container_width=True,
-            height=200,
-        )
+        # Line chart — only valid readings
+        if valid:
+            valid_times = [t for w, t in zip(weights, times) if w >= 50]
+            df_chart = pd.DataFrame({"Weight (g)": valid}, index=pd.to_datetime(valid_times))
+            chart_slot.line_chart(df_chart, color=["#7C6BB5"], use_container_width=True, height=200)
+        else:
+            chart_slot.empty()
 
-        # Stats row
-        stats_slot.markdown(f"""
-        <div style="margin-top:10px;">
-          <span class="stat-pill"><span class="stat-label">Min</span><span class="stat-val">{w_arr.min():,.1f} g</span></span>
-          <span class="stat-pill"><span class="stat-label">Max</span><span class="stat-val">{w_arr.max():,.1f} g</span></span>
-          <span class="stat-pill"><span class="stat-label">Mean</span><span class="stat-val">{w_arr.mean():,.1f} g</span></span>
-          <span class="stat-pill"><span class="stat-label">Std Dev</span><span class="stat-val">{w_arr.std():,.1f} g</span></span>
-          <span class="stat-pill"><span class="stat-label">Readings</span><span class="stat-val">{len(weights)}</span></span>
-        </div>
-        """, unsafe_allow_html=True)
+        # Stats — only valid readings
+        if valid:
+            v_arr = np.array(valid)
+            stats_slot.markdown(f"""
+            <div style="margin-top:10px;">
+              <span class="stat-pill"><span class="stat-label">Min</span><span class="stat-val">{v_arr.min():,.1f} g</span></span>
+              <span class="stat-pill"><span class="stat-label">Max</span><span class="stat-val">{v_arr.max():,.1f} g</span></span>
+              <span class="stat-pill"><span class="stat-label">Mean</span><span class="stat-val">{v_arr.mean():,.1f} g</span></span>
+              <span class="stat-pill"><span class="stat-label">Std Dev</span><span class="stat-val">{v_arr.std():,.1f} g</span></span>
+              <span class="stat-pill"><span class="stat-label">Readings</span><span class="stat-val">{len(valid)}</span></span>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            stats_slot.empty()
 
     else:
         if connected:
