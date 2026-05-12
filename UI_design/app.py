@@ -11,6 +11,7 @@ st.set_page_config(
     page_title="Smart Cat Litter Box Monitor",
     page_icon="🐾",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 # ── Custom CSS ────────────────────────────────────────────────────────────────
@@ -19,31 +20,42 @@ st.markdown("""
   @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap');
   @import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=swap');
 
-  html, body, [class*="css"] {
-    font-family: 'Nunito', sans-serif !important;
+  /*
+   * Do NOT use [class*="css"] { font-family: Nunito } — Streamlit’s layout
+   * uses many class names containing "css", and that overrides Material Symbols
+   * for header/sidebar icons → raw text like "keyboard_double" appears.
+   */
+  html, body {
     background-color: #FBFAF6;
     color: #2A2440;
   }
+  .stApp {
+    font-family: 'Nunito', sans-serif;
+    background-color: #FBFAF6;
+  }
 
-  /* Main background */
-  .stApp { background-color: #FBFAF6; }
+  /* Restore Streamlit Material icons (sidebar chevron, toolbar, etc.) */
+  [data-testid="stIconMaterial"],
+  .material-symbols-rounded,
+  [class*="material-symbols"] {
+    font-family: 'Material Symbols Rounded' !important;
+    font-weight: normal !important;
+    font-style: normal !important;
+    font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24 !important;
+    letter-spacing: normal !important;
+  }
 
-  /* Hide Streamlit chrome: top bar only */
-  header[data-testid="stHeader"],
-  div[data-testid="stToolbar"],
+  /*
+   * Do NOT hide header[data-testid="stHeader"] entirely: Streamlit puts the
+   * sidebar open/close control in the header. Hiding it makes the sidebar
+   * unreachable if collapsed or on narrow viewports.
+   */
+  header[data-testid="stHeader"] {
+    background-color: #FBFAF6 !important;
+    box-shadow: none !important;
+  }
   div[data-testid="stDecoration"] {
     display: none !important;
-  }
-
-  /* Hide sidebar collapse/expand buttons and broken icon text */
-  button[data-testid="stSidebarCollapseButton"],
-  [data-testid="stSidebarCollapsedControl"],
-  [data-testid="stIconMaterial"] {
-    display: none !important;
-  }
-  /* Restore sensible top spacing once header is gone (main column only) */
-  .main .block-container {
-    padding-top: 1.25rem !important;
   }
 
   /* Sidebar — same warm off-white as main; avoid blue drag-select on labels */
@@ -55,7 +67,7 @@ st.markdown("""
     -webkit-user-select: none;
     -moz-user-select: none;
   }
-  [data-testid="stSidebar"] * {
+  [data-testid="stSidebar"] *:not([data-testid="stIconMaterial"]):not(.material-symbols-rounded):not([class*="material-symbols"]) {
     font-family: 'Nunito', sans-serif !important;
   }
   [data-testid="stSidebar"] input,
@@ -188,6 +200,8 @@ def get_state():
         "lock": threading.Lock(),
         "stop_event": threading.Event(),
         "ser": None,
+        # Software tare: empty-platform baseline (g); None until first stable window
+        "tare_baseline_g": None,
     }
 
 
@@ -240,11 +254,64 @@ def start_reader(port: str):
     state["stop_event"].set()
     time.sleep(0.3)
     state["stop_event"].clear()
+    with state["lock"]:
+        state["tare_baseline_g"] = None
     t = threading.Thread(target=serial_reader, args=(port,), daemon=True)
     t.start()
 
 
-# ── Placeholder data helpers ──────────────────────────────────────────────────
+# ── Display tare: stable empty platform → baseline → net weight, floor to 0 ──
+AUTO_TARE_STABLE_STD_G = 12.0
+AUTO_TARE_BLEND = 0.12
+AUTO_TARE_NEAR_BASE_G = 120.0
+NET_ZERO_FLOOR_G = 28.0
+AUTO_TARE_MIN_SAMPLES = 6
+
+
+def compute_net_weight(raw_g: float, weights: list, state: dict, auto_tare: bool) -> tuple[float, float | None]:
+    """
+    Return (display_g, baseline_or_None).
+    When auto_tare and recent readings are stable, EMA-update baseline so an empty
+    platform drifts to ~0 g; net = raw - baseline, floored to 0 below noise threshold.
+    """
+    if not auto_tare:
+        return raw_g, None
+
+    if len(weights) < AUTO_TARE_MIN_SAMPLES:
+        with state["lock"]:
+            b = state["tare_baseline_g"]
+        if b is None:
+            return raw_g, None
+        net = raw_g - b
+        return (0.0 if net < NET_ZERO_FLOOR_G else net), b
+
+    tail = np.array(weights[-AUTO_TARE_MIN_SAMPLES:], dtype=float)
+    mn = float(np.mean(tail))
+    sd = float(np.std(tail))
+
+    with state["lock"]:
+        b = state["tare_baseline_g"]
+        if sd < AUTO_TARE_STABLE_STD_G:
+            if b is None:
+                b = mn
+            elif abs(mn - b) < AUTO_TARE_NEAR_BASE_G:
+                b = (1.0 - AUTO_TARE_BLEND) * b + AUTO_TARE_BLEND * mn
+            state["tare_baseline_g"] = b
+
+    if b is None:
+        return raw_g, None
+    net = raw_g - b
+    if net < NET_ZERO_FLOOR_G:
+        return 0.0, b
+    return net, b
+
+
+def net_series_for_chart(weights: list, baseline: float | None) -> list[float]:
+    if baseline is None:
+        return list(weights)
+    return [max(0.0, w - baseline) for w in weights]
+
+
 def make_visit_history():
     rng = np.random.default_rng(42)
     cats = ["Wesley", "Pupu"]
@@ -290,10 +357,45 @@ def visit_history_status_style(val):
     return ""
 
 
+def list_serial_devices():
+    """Return [(device_path, description), ...] for pyserial; empty if unavailable."""
+    try:
+        from serial.tools import list_ports  # type: ignore
+
+        return [(p.device, p.description or "") for p in list_ports.comports()]
+    except Exception:
+        return []
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### Connection")
     port = st.text_input("Serial port", value="/dev/cu.usbmodem1101", help="macOS: often under /dev/cu.usbmodem…")
+
+    devices = list_serial_devices()
+    if devices:
+        st.caption("**This Mac currently shows:**")
+        for dev, desc in devices:
+            short = (desc[:52] + "…") if len(desc) > 54 else desc
+            st.caption(f"`{dev}` — {short}")
+    else:
+        st.caption("No USB serial ports detected right now.")
+
+    with st.expander("Why “No such file or directory”?"):
+        st.markdown(
+            """
+That message means **macOS does not have a device file at that exact path** — not a wrong baud rate.
+
+Common causes:
+
+1. **Board unplugged** or a **charge-only USB cable** (no data wires).
+2. **Port name changed** after replugging — the number often shifts (e.g. `1101` → `1102`). Use a path from the list above.
+3. **Another app has the port open** (Arduino Serial Monitor, `screen`, another Streamlit tab). Close it and try Connect again.
+4. **Wrong interface** — use **`/dev/cu.*`** (not `tty.*`) for pyserial on macOS.
+
+In Terminal you can run: `ls /dev/cu.usb*` to see current names.
+            """
+        )
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
@@ -309,6 +411,7 @@ with st.sidebar:
         state["stop_event"].set()
         with state["lock"]:
             state["connected"] = False
+            state["tare_baseline_g"] = None
 
     state = get_state()
     with state["lock"]:
@@ -329,6 +432,18 @@ with st.sidebar:
         st.markdown('<span class="dot-red">●</span> Disconnected', unsafe_allow_html=True)
         if err_msg:
             st.caption(err_msg)
+
+    st.divider()
+    st.markdown("**Live weight display**")
+    st.checkbox(
+        "Auto zero: show ~0 g when the platform is stable and empty",
+        value=True,
+        key="auto_tare_sw",
+        help="When recent readings have low spread, treat as empty platform and track a baseline; display is raw minus baseline (floored to 0 below a noise threshold).",
+    )
+    st.caption("Different from **Tare (Zero)** above: that sends a command to the firmware; this only adjusts the on-screen zero.")
+    if st.button("Set current reading as empty baseline", use_container_width=True, key="tare_snap_ui"):
+        st.session_state["_tare_snap_now"] = True
 
     st.divider()
 
@@ -357,7 +472,7 @@ st.markdown("""
 
 # ── Section 1: Live Weight Monitor ────────────────────────────────────────────
 st.markdown('<div class="section-title">⚖️ Live Weight Monitor</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-sub">Real-time load cell reading from HX711 • updates every 500 ms</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-sub">Real-time HX711 reading • optional auto zero when the platform is stable (toggle in sidebar)</div>', unsafe_allow_html=True)
 
 weight_num_slot = st.empty()
 chart_slot = st.empty()
@@ -497,53 +612,51 @@ for icon, ts, msg in alerts:
 # ── Live update loop ──────────────────────────────────────────────────────────
 while True:
     state = get_state()
+    if st.session_state.pop("_tare_snap_now", False):
+        with state["lock"]:
+            wb = list(state["weight_buf"])
+        if wb:
+            with state["lock"]:
+                state["tare_baseline_g"] = float(wb[-1])
+
     with state["lock"]:
         weights = list(state["weight_buf"])
         times = list(state["time_buf"])
         connected = state["connected"]
 
     if weights:
-        current_w = weights[-1]
-        valid = [w for w in weights if w >= 50]
+        raw_g = float(weights[-1])
+        auto_tare = bool(st.session_state.get("auto_tare_sw", True))
+        display_w, baseline = compute_net_weight(raw_g, weights, state, auto_tare)
 
-        # Big number — hide negative readings
-        if current_w < 50:
-            weight_num_slot.markdown("""
-            <div style="margin: 12px 0 6px;">
-              <span class="weight-number" style="color:#C4BDD8;">--</span>
-              <span class="weight-unit">g &nbsp;<span style="font-size:16px;color:#7A7490;">No load detected</span></span>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            weight_num_slot.markdown(f"""
-            <div style="margin: 12px 0 6px;">
-              <span class="weight-number">{current_w:,.1f}</span>
-              <span class="weight-unit">g</span>
-            </div>
-            """, unsafe_allow_html=True)
+        # Big number — net weight after display tare
+        sub = ""
+        if auto_tare and baseline is not None:
+            sub = f'<span style="font-size:14px;color:#7A7490;margin-left:10px;">Baseline ≈ {baseline:,.0f} g (raw)</span>'
+        weight_num_slot.markdown(f"""
+        <div style="margin: 12px 0 6px;">
+          <span class="weight-number">{display_w:,.1f}</span>
+          <span class="weight-unit">g{sub}</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-        # Line chart — only valid readings
-        if valid:
-            valid_times = [t for w, t in zip(weights, times) if w >= 50]
-            df_chart = pd.DataFrame({"Weight (g)": valid}, index=pd.to_datetime(valid_times))
+        nets = net_series_for_chart(weights, baseline if auto_tare else None)
+        if nets:
+            df_chart = pd.DataFrame({"Weight (g)": nets}, index=pd.to_datetime(times))
             chart_slot.line_chart(df_chart, color=["#7C6BB5"], use_container_width=True, height=200)
         else:
             chart_slot.empty()
 
-        # Stats — only valid readings
-        if valid:
-            v_arr = np.array(valid)
-            stats_slot.markdown(f"""
-            <div style="margin-top:10px;">
-              <span class="stat-pill"><span class="stat-label">Min</span><span class="stat-val">{v_arr.min():,.1f} g</span></span>
-              <span class="stat-pill"><span class="stat-label">Max</span><span class="stat-val">{v_arr.max():,.1f} g</span></span>
-              <span class="stat-pill"><span class="stat-label">Mean</span><span class="stat-val">{v_arr.mean():,.1f} g</span></span>
-              <span class="stat-pill"><span class="stat-label">Std Dev</span><span class="stat-val">{v_arr.std():,.1f} g</span></span>
-              <span class="stat-pill"><span class="stat-label">Readings</span><span class="stat-val">{len(valid)}</span></span>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            stats_slot.empty()
+        arr = np.array(nets, dtype=float)
+        stats_slot.markdown(f"""
+        <div style="margin-top:10px;">
+          <span class="stat-pill"><span class="stat-label">Min</span><span class="stat-val">{arr.min():,.1f} g</span></span>
+          <span class="stat-pill"><span class="stat-label">Max</span><span class="stat-val">{arr.max():,.1f} g</span></span>
+          <span class="stat-pill"><span class="stat-label">Mean</span><span class="stat-val">{arr.mean():,.1f} g</span></span>
+          <span class="stat-pill"><span class="stat-label">Std Dev</span><span class="stat-val">{arr.std():,.1f} g</span></span>
+          <span class="stat-pill"><span class="stat-label">Readings</span><span class="stat-val">{len(nets)}</span></span>
+        </div>
+        """, unsafe_allow_html=True)
 
     else:
         if connected:
