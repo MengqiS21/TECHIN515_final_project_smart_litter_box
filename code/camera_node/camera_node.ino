@@ -2,24 +2,24 @@
  * ============================================================
  *  Smart Cat Litter Box — Camera Node
  *  Board : XIAO ESP32S3 Sense (with camera)
- *  Role  : PIR 触发拍照 → 猫咪识别推理 → ESP-NOW 发送结果
+ *  Role  : PIR triggers photo → cat inference → send result via ESP-NOW
  *
- *  接线：
+ *  Wiring:
  *    PIR OUT  → GPIO4 (D3)
- *    Camera   → 板载 (无需额外接线)
+ *    Camera   → onboard (no extra wiring needed)
  *
- *  Arduino 设置：
+ *  Arduino IDE settings:
  *    Board: XIAO_ESP32S3 | PSRAM: OPI PSRAM | 115200 baud
  *
- *  依赖库（Arduino Library Manager）：
- *    - ESP32 Arduino core (已内置 esp_camera, esp_now)
- *    - Edge Impulse SDK (cat-identifier_inferencing) — 见下方说明
+ *  Required libraries (Arduino Library Manager):
+ *    - ESP32 Arduino core (esp_camera and esp_now are built in)
+ *    - Edge Impulse SDK (cat-identifier_inferencing) — see note below
  *
- *  Edge Impulse 模型集成：
- *    1. 在 Edge Impulse 导出 "Arduino library"
- *    2. 解压后添加到 Arduino/libraries/
- *    3. 取消注释下方 #include <cat-identifier_inferencing.h>
- *    4. 取消注释 runEdgeImpulseInference() 内的实际推理代码
+ *  Edge Impulse model integration:
+ *    1. Export "Arduino library" from your Edge Impulse project
+ *    2. Unzip and add the folder to Arduino/libraries/
+ *    3. Uncomment the #include <cat-identifier_inferencing.h> line below
+ *    4. Uncomment the actual inference code inside runInference()
  * ============================================================
  */
 
@@ -27,14 +27,14 @@
 #include "esp_now.h"
 #include "WiFi.h"
 
-// ── 若已集成 Edge Impulse 模型，取消下行注释 ─────────────────
+// Uncomment when the Edge Impulse model library is installed
 // #include <cat-identifier_inferencing.h>
 
 // ── PIR ──────────────────────────────────────────────────────
 #define PIR_PIN          4       // GPIO4 = D3
-#define PIR_COOLDOWN_MS  5000   // 同一次访问内最短间隔
+#define PIR_COOLDOWN_MS  5000   // minimum interval between triggers for the same visit
 
-// ── 摄像头引脚 (XIAO ESP32S3 Sense 固定引脚) ─────────────────
+// ── Camera pins (fixed for XIAO ESP32S3 Sense) ───────────────
 #define PWDN_GPIO_NUM    -1
 #define RESET_GPIO_NUM   -1
 #define XCLK_GPIO_NUM    10
@@ -52,33 +52,33 @@
 #define HREF_GPIO_NUM    47
 #define PCLK_GPIO_NUM    13
 
-// ── ESP-NOW 目标 MAC（填入 Weight Node 的 MAC 地址） ──────────
-// 运行 weight_node 后，串口会打印本机 MAC，复制到这里
-uint8_t weightNodeMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // 广播，调试阶段使用
+// ── Target MAC for ESP-NOW (fill in the Weight Node MAC) ─────
+// Flash weight_node first; it prints its MAC on the serial monitor — copy it here
+uint8_t weightNodeMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // broadcast for debugging
 
-// ── ESP-NOW 数据包结构（与 weight_node 保持一致） ────────────
+// ── ESP-NOW packet struct (must match weight_node) ───────────
 typedef struct {
-  uint8_t  cat_id;         // 0=Unknown 1=Wesley 2=Pupu
+  uint8_t  cat_id;         // 0=Unknown  1=Wesley  2=Pupu
   float    confidence;     // 0.0 ~ 1.0
   uint32_t timestamp_ms;   // millis()
   char     method[8];      // "CAM" or "WEIGHT"
 } CatIDPacket;
 
-// ── 状态 ─────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────
 enum CameraState { IDLE, CAT_DETECTED, COOLDOWN };
 CameraState camState = IDLE;
 
 unsigned long lastTriggerTime = 0;
 int photoCount = 0;
 
-// ── 前向声明 ─────────────────────────────────────────────────
+// ── Forward declarations ──────────────────────────────────────
 bool initCamera();
 uint8_t runInference(camera_fb_t* fb, float* out_confidence);
 void sendCatID(uint8_t cat_id, float confidence);
 void onDataSent(const uint8_t* mac, esp_now_send_status_t status);
 
 // ─────────────────────────────────────────────────────────────
-//  摄像头初始化
+//  Camera initialization
 // ─────────────────────────────────────────────────────────────
 bool initCamera() {
   camera_config_t config;
@@ -105,7 +105,7 @@ bool initCamera() {
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 
   if (psramFound()) {
-    config.frame_size   = FRAMESIZE_QVGA;  // 320x240，模型输入尺寸
+    config.frame_size   = FRAMESIZE_QVGA;  // 320x240, matches model input size
     config.jpeg_quality = 12;
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -126,22 +126,22 @@ bool initCamera() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  推理：识别是哪只猫
-//  返回值：0=Unknown 1=Wesley 2=Pupu
-//  out_confidence：置信度 0~1
+//  Run cat inference on a captured frame
+//  Returns: 0=Unknown  1=Wesley  2=Pupu
+//  out_confidence: classification confidence 0~1
 // ─────────────────────────────────────────────────────────────
 uint8_t runInference(camera_fb_t* fb, float* out_confidence) {
 
-  /* ── 已集成 Edge Impulse 模型时，替换为以下代码 ─────────────
+  /* ── Replace this block when the Edge Impulse library is installed ──────────
   if (!fb) { *out_confidence = 0; return 0; }
 
-  // 将 JPEG 帧转为 RGB888 供模型输入
+  // Convert JPEG frame to RGB888 for model input
   uint8_t* rgb_buf = NULL;
   size_t   rgb_len = 0;
   bool ok = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, &rgb_buf, &rgb_len);
   if (!ok || !rgb_buf) { *out_confidence = 0; return 0; }
 
-  // Edge Impulse signal
+  // Build Edge Impulse signal
   signal_t signal;
   numpy::signal_from_buffer((float*)rgb_buf, EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT * 3, &signal);
 
@@ -151,7 +151,7 @@ uint8_t runInference(camera_fb_t* fb, float* out_confidence) {
 
   if (err != EI_IMPULSE_OK) { *out_confidence = 0; return 0; }
 
-  // 找最高置信度的标签
+  // Find the label with the highest confidence
   float best = 0;
   int   best_idx = 0;
   for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
@@ -161,26 +161,26 @@ uint8_t runInference(camera_fb_t* fb, float* out_confidence) {
     }
   }
   *out_confidence = best;
-  // 标签顺序取决于你的 Edge Impulse 项目设置，按实际顺序映射
+  // Label order depends on your Edge Impulse project — map accordingly
   if      (strcmp(result.classification[best_idx].label, "Wesley") == 0) return 1;
   else if (strcmp(result.classification[best_idx].label, "Pupu")   == 0) return 2;
   else return 0;
-  ─────────────────────────────────────────────────────────── */
+  ────────────────────────────────────────────────────────────────────────── */
 
-  // ── 模型未集成时的 Placeholder：随机返回（调试用） ──────────
+  // Placeholder while model is not yet integrated — weight_node uses weight-based ID instead
   *out_confidence = 0.0;
-  return 0;  // 0 = 由 weight_node 通过体重判断
+  return 0;
 }
 
 // ─────────────────────────────────────────────────────────────
-//  ESP-NOW 发送回调
+//  ESP-NOW send callback
 // ─────────────────────────────────────────────────────────────
 void onDataSent(const uint8_t* mac, esp_now_send_status_t status) {
   Serial.printf("[ESP-NOW] Send %s\n", status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
 }
 
 // ─────────────────────────────────────────────────────────────
-//  打包并发送猫咪识别结果
+//  Pack and send cat identification result via ESP-NOW
 // ─────────────────────────────────────────────────────────────
 void sendCatID(uint8_t cat_id, float confidence) {
   CatIDPacket pkt;
@@ -208,14 +208,14 @@ void setup() {
   // PIR
   pinMode(PIR_PIN, INPUT);
   Serial.println("[PIR] Ready on GPIO4");
-  delay(2000);  // PIR 热身
+  delay(2000);  // PIR warm-up
 
   // Camera
   if (!initCamera()) {
     Serial.println("[ERROR] Camera init failed");
   }
 
-  // ESP-NOW — 必须在 WiFi STA 模式下初始化
+  // ESP-NOW must be initialized in WiFi STA mode
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
     Serial.println("[ESP-NOW] Init FAILED");
@@ -223,7 +223,7 @@ void setup() {
   }
   esp_now_register_send_cb(onDataSent);
 
-  // 注册 peer（广播或指定 MAC）
+  // Register peer (broadcast or specific MAC)
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, weightNodeMAC, 6);
   peerInfo.channel = 0;
@@ -234,7 +234,7 @@ void setup() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Loop — PIR 状态机
+//  Loop — PIR state machine
 // ─────────────────────────────────────────────────────────────
 void loop() {
   int pirVal = digitalRead(PIR_PIN);
@@ -268,7 +268,7 @@ void loop() {
       break;
 
     case CAT_DETECTED:
-      // 拍照推理在 IDLE case 内同步完成，直接跳 COOLDOWN
+      // Capture and inference are handled synchronously in the IDLE case — jump to COOLDOWN
       camState = COOLDOWN;
       break;
 

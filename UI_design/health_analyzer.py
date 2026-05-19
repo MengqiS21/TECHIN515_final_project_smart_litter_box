@@ -1,39 +1,37 @@
 """
 health_analyzer.py
 ──────────────────
-读取 weight_node 串口的 visit:JSON 行，存入本地 CSV，
-并对每只猫进行健康趋势分析 + 异常检测。
+Reads visit:JSON lines from the weight_node serial port, stores records
+in a local CSV, and runs health trend analysis and anomaly detection per cat.
 
-算法概述
-────────
-1. 数据解析：从串口实时读 "visit:{...}" 行，追加到 visits.csv
-2. 特征工程：
-     cat_weight_g    - 当次猫咪体重估算
-     excrement_g     - 当次排泄物重量
-     duration_s      - 停留时长
-     visit_freq      - 当天访问次数
-     hour_of_day     - 访问时间（0-23）
-3. 健康指标（滑动窗口 7 天）：
-     weight_trend    - 体重 7 日均值 + 线性趋势斜率
-     excrement_avg   - 平均排泄物重量
-     freq_avg        - 平均每日访问频率
-4. 异常检测：
-     Z-score (>2σ)   - 快速标记单次异常
-     线性回归斜率     - 检测长期体重下降趋势
-5. 结果：可被 Streamlit app.py 直接导入，或单独运行打印报告
+Algorithm overview
+──────────────────
+1. Data ingestion : background thread reads "visit:{...}" lines from serial → appends to visits.csv
+2. Feature engineering:
+     cat_weight_g  - estimated cat body weight for this visit
+     excrement_g   - waste weight deposited during this visit
+     duration_s    - time spent inside the box
+     visit_freq    - visit count for the day
+     hour_of_day   - hour of visit (0-23)
+3. Health metrics (7-day rolling window):
+     weight_trend  - 7-day mean + linear regression slope
+     excrement_avg - average waste weight per visit
+     freq_avg      - average daily visit frequency
+4. Anomaly detection:
+     Z-score (>2.5σ)  - flags individual outlier visits
+     Linear slope      - detects sustained weight loss trend
+     Isolation Forest  - multi-feature anomaly detection (requires ≥20 records)
+5. Output: importable by Streamlit app.py, or run standalone to print a report
 
-依赖：pip install pyserial pandas numpy scipy scikit-learn
+Dependencies: pip install pyserial pandas numpy scipy scikit-learn
 """
 
 import json
-import re
 import time
 import threading
 import csv
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections import defaultdict
 
 import pandas as pd
 import numpy as np
@@ -41,34 +39,34 @@ from scipy import stats
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 
-# ── 配置 ────────────────────────────────────────────────────────
-CSV_PATH   = Path(__file__).parent / "visits.csv"
+# ── Configuration ────────────────────────────────────────────────────────────
+CSV_PATH    = Path(__file__).parent / "visits.csv"
 SERIAL_PORT = "/dev/cu.usbmodem1101"
 BAUD_RATE   = 115200
 
-# 猫咪配置（体重基准，可在使用过程中自动修正）
+# Cat roster (body weight baseline; auto-refined over time)
 CAT_CONFIG = {
     1: {"name": "Wesley", "weight_baseline_g": 4300, "color": "#7C6BB5"},
     2: {"name": "Pupu",   "weight_baseline_g": 4700, "color": "#E88FB4"},
 }
 
-# 异常检测阈值
-WEIGHT_DROP_ALERT_G     = 200   # 7 日内体重下降超过此值触发警告
-EXCREMENT_LOW_G         = 5     # 单次排泄物 < 5g 视为异常
-EXCREMENT_HIGH_G        = 150   # 单次排泄物 > 150g 视为异常
-VISIT_HIGH_DAILY        = 6     # 每日访问 > 6 次触发警告
-VISIT_LOW_DAILY         = 1     # 每日访问 < 1 次触发警告
-DURATION_HIGH_S         = 600   # 停留 > 10 分钟触发警告
-ZSCORE_THRESHOLD        = 2.5   # Z-score 单次异常阈值
+# Anomaly detection thresholds
+WEIGHT_DROP_ALERT_G = 200   # alert if weight drops more than this over 7 days
+EXCREMENT_LOW_G     = 5     # single visit waste < 5 g is abnormally low
+EXCREMENT_HIGH_G    = 150   # single visit waste > 150 g is abnormally high
+VISIT_HIGH_DAILY    = 6     # more than 6 visits/day triggers an alert
+VISIT_LOW_DAILY     = 1     # fewer than 1 visit/day triggers an alert
+DURATION_HIGH_S     = 600   # stay longer than 10 min may indicate straining
+ZSCORE_THRESHOLD    = 2.5   # Z-score cutoff for single-visit anomaly
 
-# ── CSV 字段 ─────────────────────────────────────────────────────
+# ── CSV schema ───────────────────────────────────────────────────────────────
 CSV_FIELDS = [
     "timestamp", "cat_id", "cat_name", "method", "confidence",
     "duration_s", "cat_weight_g", "excrement_g",
     "entry_ms", "exit_ms"
 ]
 
-# ── CSV 初始化 ────────────────────────────────────────────────────
+# ── CSV helpers ──────────────────────────────────────────────────────────────
 def init_csv():
     if not CSV_PATH.exists():
         with open(CSV_PATH, "w", newline="") as f:
@@ -76,7 +74,7 @@ def init_csv():
 
 
 def append_visit(record: dict):
-    """将一条访问记录追加写入 CSV"""
+    """Append one visit record to the CSV file."""
     init_csv()
     cat_name = CAT_CONFIG.get(record.get("cat_id", 0), {}).get("name", "Unknown")
     row = {
@@ -95,9 +93,9 @@ def append_visit(record: dict):
         csv.DictWriter(f, fieldnames=CSV_FIELDS).writerow(row)
 
 
-# ── 串口解析线程 ──────────────────────────────────────────────────
+# ── Serial ingestion thread ───────────────────────────────────────────────────
 def parse_and_store_serial(port: str, stop_event: threading.Event):
-    """后台线程：读串口，遇到 visit:JSON 行则保存"""
+    """Background thread: reads serial port and saves every visit:JSON line."""
     try:
         import serial
     except ImportError:
@@ -121,9 +119,9 @@ def parse_and_store_serial(port: str, stop_event: threading.Event):
         print(f"[health_analyzer] Serial error: {e}")
 
 
-# ── 数据加载 ─────────────────────────────────────────────────────
+# ── Data loading ──────────────────────────────────────────────────────────────
 def load_visits(days: int = 30) -> pd.DataFrame:
-    """加载最近 N 天的访问记录"""
+    """Load visit records from the last N days."""
     if not CSV_PATH.exists():
         return pd.DataFrame(columns=CSV_FIELDS)
     df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
@@ -134,14 +132,14 @@ def load_visits(days: int = 30) -> pd.DataFrame:
     return df
 
 
-# ── 特征工程 ─────────────────────────────────────────────────────
+# ── Feature engineering ───────────────────────────────────────────────────────
 def compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    按 (date, cat_id) 聚合每日特征：
-      - mean_cat_weight_g : 当日平均体重
-      - mean_excrement_g  : 当日平均排泄物重量
-      - visit_count       : 当日访问次数
-      - mean_duration_s   : 当日平均停留时长
+    Aggregate per (date, cat_id) daily features:
+      - mean_cat_weight_g : average body weight for the day
+      - mean_excrement_g  : average waste weight per visit
+      - visit_count       : number of visits
+      - mean_duration_s   : average time spent per visit
     """
     if df.empty:
         return pd.DataFrame()
@@ -159,13 +157,13 @@ def compute_daily_features(df: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
-# ── 体重趋势分析 ──────────────────────────────────────────────────
+# ── Weight trend analysis ─────────────────────────────────────────────────────
 def analyze_weight_trend(daily: pd.DataFrame, cat_id: int, window_days: int = 7):
     """
-    返回：
-      recent_avg  - 最近 window_days 天均值
-      slope_g_day - 每天体重变化斜率（负值=下降）
-      total_drop  - 窗口内总变化
+    Returns:
+      recent_avg  - mean weight over the last window_days days
+      slope_g_day - grams/day slope (negative = weight loss)
+      total_drop  - total change over the window
     """
     cat_df = daily[daily["cat_id"] == cat_id].sort_values("date").tail(window_days)
     if len(cat_df) < 3:
@@ -177,16 +175,16 @@ def analyze_weight_trend(daily: pd.DataFrame, cat_id: int, window_days: int = 7)
 
     return {
         "recent_avg":  float(y.mean()),
-        "slope_g_day": float(slope),       # 克/天，负值=体重在下降
-        "total_drop":  float(y[-1] - y[0]) # 窗口内总变化
+        "slope_g_day": float(slope),        # negative = losing weight
+        "total_drop":  float(y[-1] - y[0])  # total change across the window
     }
 
 
-# ── Z-score 单次异常检测 ──────────────────────────────────────────
+# ── Z-score single-visit anomaly detection ────────────────────────────────────
 def detect_single_anomalies(df: pd.DataFrame, cat_id: int) -> pd.DataFrame:
     """
-    对 cat_weight_g, excrement_g, duration_s 计算 Z-score，
-    超过阈值的行标记为异常。
+    Compute Z-score across cat_weight_g, excrement_g, and duration_s.
+    Rows exceeding the threshold are flagged as anomalies.
     """
     cat_df = df[df["cat_id"] == cat_id].copy()
     if len(cat_df) < 5:
@@ -197,17 +195,17 @@ def detect_single_anomalies(df: pd.DataFrame, cat_id: int) -> pd.DataFrame:
 
     scaler = StandardScaler()
     z = scaler.fit_transform(cat_df[features])
-    cat_df["max_z"] = np.abs(z).max(axis=1)
+    cat_df["max_z"]  = np.abs(z).max(axis=1)
     cat_df["anomaly"] = cat_df["max_z"] > ZSCORE_THRESHOLD
 
     return cat_df[cat_df["anomaly"]].copy()
 
 
-# ── Isolation Forest（多特征异常检测） ───────────────────────────
+# ── Isolation Forest multi-feature anomaly detection ─────────────────────────
 def detect_isolation_forest(df: pd.DataFrame, cat_id: int) -> pd.DataFrame:
     """
-    用 IsolationForest 检测多维异常（体重 + 排泄物 + 时长 + 访问频率）。
-    需要至少 20 条记录。
+    Uses IsolationForest on (cat_weight_g, excrement_g, duration_s, hour_of_day).
+    Requires at least 20 records for meaningful results.
     """
     cat_df = df[df["cat_id"] == cat_id].copy()
     features = ["cat_weight_g", "excrement_g", "duration_s", "hour_of_day"]
@@ -218,110 +216,105 @@ def detect_isolation_forest(df: pd.DataFrame, cat_id: int) -> pd.DataFrame:
 
     clf = IsolationForest(contamination=0.05, random_state=42)
     X   = cat_df[features].values
-    cat_df["if_label"] = clf.fit_predict(X)  # -1=anomaly
+    cat_df["if_label"] = clf.fit_predict(X)   # -1 = anomaly
     cat_df["anomaly"]  = cat_df["if_label"] == -1
 
     return cat_df[cat_df["anomaly"]].copy()
 
 
-# ── 规则异常 ─────────────────────────────────────────────────────
+# ── Rule-based alerts ─────────────────────────────────────────────────────────
 def rule_based_alerts(df: pd.DataFrame, daily: pd.DataFrame) -> list[dict]:
-    """
-    基于阈值的规则告警，返回告警列表。
-    """
+    """Generate threshold-based health alerts; returns a list of alert dicts."""
     alerts = []
 
     for cat_id, cfg in CAT_CONFIG.items():
         name = cfg["name"]
         cat_daily = daily[daily["cat_id"] == cat_id].sort_values("date")
 
-        # 1. 体重下降趋势
+        # 1. Weight loss trend
         trend = analyze_weight_trend(daily, cat_id, window_days=7)
         if trend["slope_g_day"] is not None:
             if trend["slope_g_day"] < -(WEIGHT_DROP_ALERT_G / 7):
                 alerts.append({
-                    "level": "⚠️",
-                    "cat":   name,
-                    "msg":   f"{name} 体重过去 7 天每天平均下降 {abs(trend['slope_g_day']):.0f}g，建议检查饮食。",
+                    "level": "⚠️", "cat": name,
+                    "msg": f"{name}'s weight has been dropping ~{abs(trend['slope_g_day']):.0f} g/day over the past 7 days. Check diet.",
                 })
             if trend["total_drop"] is not None and trend["total_drop"] < -WEIGHT_DROP_ALERT_G:
                 alerts.append({
-                    "level": "⚠️",
-                    "cat":   name,
-                    "msg":   f"{name} 7 天内体重共下降 {abs(trend['total_drop']):.0f}g，建议就医检查。",
+                    "level": "⚠️", "cat": name,
+                    "msg": f"{name} has lost {abs(trend['total_drop']):.0f} g over 7 days. Consider a vet visit.",
                 })
 
-        # 2. 排泄物重量异常（最近 3 次均值）
+        # 2. Waste weight anomaly (mean of last 3 visits)
         recent_visits = df[df["cat_id"] == cat_id].sort_values("timestamp").tail(3)
         if len(recent_visits) >= 3:
             avg_excrement = recent_visits["excrement_g"].mean()
             if avg_excrement < EXCREMENT_LOW_G:
                 alerts.append({
-                    "level": "⚠️",
-                    "cat":   name,
-                    "msg":   f"{name} 最近 3 次排泄物均重仅 {avg_excrement:.1f}g，可能便秘或脱水。",
+                    "level": "⚠️", "cat": name,
+                    "msg": f"{name}'s average waste over the last 3 visits is only {avg_excrement:.1f} g — possible constipation or dehydration.",
                 })
             elif avg_excrement > EXCREMENT_HIGH_G:
                 alerts.append({
-                    "level": "⚠️",
-                    "cat":   name,
-                    "msg":   f"{name} 最近 3 次排泄物均重 {avg_excrement:.1f}g，偏多，请注意。",
+                    "level": "⚠️", "cat": name,
+                    "msg": f"{name}'s average waste over the last 3 visits is {avg_excrement:.1f} g — higher than normal.",
                 })
 
-        # 3. 访问频率（昨天）
+        # 3. Daily visit frequency (yesterday)
         if not cat_daily.empty:
             yesterday = (datetime.now() - timedelta(days=1)).date()
-            yest_row = cat_daily[cat_daily["date"] == yesterday]
+            yest_row  = cat_daily[cat_daily["date"] == yesterday]
             if not yest_row.empty:
                 freq = int(yest_row["visit_count"].values[0])
                 if freq > VISIT_HIGH_DAILY:
                     alerts.append({
-                        "level": "⚠️",
-                        "cat":   name,
-                        "msg":   f"{name} 昨天访问猫砂盆 {freq} 次，超出正常范围（≤{VISIT_HIGH_DAILY}次/天），可能泌尿问题。",
+                        "level": "⚠️", "cat": name,
+                        "msg": f"{name} visited the litter box {freq} times yesterday (normal: ≤{VISIT_HIGH_DAILY}/day). Possible urinary issue.",
                     })
                 elif freq < VISIT_LOW_DAILY:
                     alerts.append({
-                        "level": "ℹ️",
-                        "cat":   name,
-                        "msg":   f"{name} 昨天仅访问猫砂盆 {freq} 次，请确认猫咪状态正常。",
+                        "level": "ℹ️", "cat": name,
+                        "msg": f"{name} only visited {freq} time(s) yesterday. Please check on the cat.",
                     })
 
-        # 4. 停留时长异常（最近一次）
+        # 4. Unusually long visit duration (most recent visit)
         recent_one = df[df["cat_id"] == cat_id].sort_values("timestamp").tail(1)
         if not recent_one.empty:
             dur = float(recent_one["duration_s"].values[0])
             if dur > DURATION_HIGH_S:
                 alerts.append({
-                    "level": "⚠️",
-                    "cat":   name,
-                    "msg":   f"{name} 最近一次在猫砂盆停留 {dur/60:.1f} 分钟，可能有排泄困难。",
+                    "level": "⚠️", "cat": name,
+                    "msg": f"{name} spent {dur/60:.1f} min in the box on the last visit — may indicate straining.",
                 })
 
     if not alerts:
-        alerts.append({"level": "✅", "cat": "All", "msg": "所有猫咪健康指标正常。"})
+        alerts.append({"level": "✅", "cat": "All", "msg": "All health metrics are normal for both cats."})
 
     return alerts
 
 
-# ── 汇总分析（供 Streamlit 调用） ──────────────────────────────────
+# ── Full health summary (called by Streamlit) ─────────────────────────────────
 def get_health_summary(days: int = 14) -> dict:
     """
-    返回完整健康摘要字典，包含：
-      - alerts        : 告警列表
-      - daily         : 每日特征 DataFrame
-      - weight_trends : 体重趋势（每只猫）
-      - anomalies     : 单次异常记录 DataFrame
+    Returns a complete health summary dict:
+      - alerts        : list of alert dicts
+      - daily         : daily feature DataFrame
+      - weight_trends : weight trend dict per cat
+      - anomalies     : DataFrame of flagged anomaly visits
     """
-    df    = load_visits(days)
+    df = load_visits(days)
     if df.empty:
-        return {"alerts": [{"level": "ℹ️", "cat": "All", "msg": "暂无访问记录"}],
-                "daily": pd.DataFrame(), "weight_trends": {}, "anomalies": pd.DataFrame()}
+        return {
+            "alerts":        [{"level": "ℹ️", "cat": "All", "msg": "No visit records yet."}],
+            "daily":         pd.DataFrame(),
+            "weight_trends": {},
+            "anomalies":     pd.DataFrame(),
+        }
 
     daily  = compute_daily_features(df)
     trends = {cat_id: analyze_weight_trend(daily, cat_id) for cat_id in CAT_CONFIG}
 
-    # 合并两种异常检测结果
+    # Merge results from both anomaly detectors
     anomaly_frames = []
     for cat_id in CAT_CONFIG:
         z_anom  = detect_single_anomalies(df, cat_id)
@@ -329,7 +322,10 @@ def get_health_summary(days: int = 14) -> dict:
         if not z_anom.empty:  anomaly_frames.append(z_anom)
         if not if_anom.empty: anomaly_frames.append(if_anom)
 
-    anomalies = pd.concat(anomaly_frames).drop_duplicates(subset=["timestamp"]) if anomaly_frames else pd.DataFrame()
+    anomalies = (
+        pd.concat(anomaly_frames).drop_duplicates(subset=["timestamp"])
+        if anomaly_frames else pd.DataFrame()
+    )
 
     alerts = rule_based_alerts(df, daily)
 
@@ -342,14 +338,14 @@ def get_health_summary(days: int = 14) -> dict:
     }
 
 
-# ── 单独运行时打印报告 ────────────────────────────────────────────
+# ── Standalone report (run directly from terminal) ────────────────────────────
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Smart Litter Box Health Analyzer")
-    parser.add_argument("--serial", action="store_true", help="从串口实时采集数据")
-    parser.add_argument("--port",   default=SERIAL_PORT,   help="串口名称")
-    parser.add_argument("--report", action="store_true",   help="打印健康报告")
+    parser.add_argument("--serial", action="store_true", help="collect data from serial port in real time")
+    parser.add_argument("--port",   default=SERIAL_PORT,  help="serial port name")
+    parser.add_argument("--report", action="store_true",  help="print health report")
     args = parser.parse_args()
 
     init_csv()
@@ -358,7 +354,7 @@ if __name__ == "__main__":
         stop = threading.Event()
         t = threading.Thread(target=parse_and_store_serial, args=(args.port, stop), daemon=True)
         t.start()
-        print(f"[health_analyzer] 实时采集中 ({args.port})，Ctrl+C 停止...")
+        print(f"[health_analyzer] Collecting from {args.port} — press Ctrl+C to stop...")
         try:
             while True: time.sleep(1)
         except KeyboardInterrupt:
@@ -367,26 +363,29 @@ if __name__ == "__main__":
     if args.report or not args.serial:
         summary = get_health_summary(days=14)
         print("\n" + "="*60)
-        print("  猫咪健康报告（最近 14 天）")
+        print("  Cat Health Report  (last 14 days)")
         print("="*60)
 
         for cat_id, cfg in CAT_CONFIG.items():
             name  = cfg["name"]
             trend = summary["weight_trends"].get(cat_id, {})
-            print(f"\n── {name} ──────────────────────────")
+            print(f"\n── {name} {'─'*30}")
             if trend.get("recent_avg"):
-                print(f"  7日均重    : {trend['recent_avg']:.0f} g")
-                print(f"  体重斜率   : {trend['slope_g_day']:+.1f} g/天")
-                print(f"  7日总变化  : {trend['total_drop']:+.0f} g")
+                print(f"  7-day avg weight : {trend['recent_avg']:.0f} g")
+                print(f"  Weight slope     : {trend['slope_g_day']:+.1f} g/day")
+                print(f"  7-day net change : {trend['total_drop']:+.0f} g")
             else:
-                print("  数据不足（需至少 3 天记录）")
+                print("  Not enough data (need at least 3 days of records)")
 
-        print("\n── 告警 ────────────────────────────────")
+        print("\n── Alerts " + "─"*40)
         for a in summary["alerts"]:
             print(f"  {a['level']} [{a['cat']}] {a['msg']}")
 
-        print(f"\n── 异常记录（共 {len(summary['anomalies'])} 条）──")
+        n_anom = len(summary["anomalies"])
+        print(f"\n── Anomalous visits ({n_anom} total) " + "─"*20)
         if not summary["anomalies"].empty:
-            print(summary["anomalies"][["timestamp", "cat_name", "cat_weight_g", "excrement_g", "duration_s"]].to_string(index=False))
+            print(summary["anomalies"][
+                ["timestamp", "cat_name", "cat_weight_g", "excrement_g", "duration_s"]
+            ].to_string(index=False))
 
         print("\n" + "="*60)
