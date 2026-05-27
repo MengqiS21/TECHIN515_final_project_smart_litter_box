@@ -1,284 +1,258 @@
 /*
- * ============================================================
- *  Smart Cat Litter Box — Camera Node
- *  Board : XIAO ESP32S3 Sense (with camera)
- *  Role  : PIR triggers photo → cat inference → send result via ESP-NOW
+ * Smart Cat Litter Box — Camera Node
+ * Board : XIAO ESP32S3 Sense  |  PSRAM: OPI PSRAM  |  115200 baud
  *
- *  Wiring:
- *    PIR OUT  → GPIO4 (D3)
- *    Camera   → onboard (no extra wiring needed)
- *
- *  Arduino IDE settings:
- *    Board: XIAO_ESP32S3 | PSRAM: OPI PSRAM | 115200 baud
- *
- *  Required libraries (Arduino Library Manager):
- *    - ESP32 Arduino core (esp_camera and esp_now are built in)
- *    - Edge Impulse SDK (cat-identifier_inferencing) — see note below
- *
- *  Edge Impulse model integration:
- *    1. Export "Arduino library" from your Edge Impulse project
- *    2. Unzip and add the folder to Arduino/libraries/
- *    3. Uncomment the #include <cat-identifier_inferencing.h> line below
- *    4. Uncomment the actual inference code inside runInference()
- * ============================================================
+ * PIR (D1/GPIO2) detects motion → capture photo → EI inference → send via ESP-NOW
+ * Based on Edge Impulse official esp32_camera example
  */
 
+#include <cat_litterbox_model.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
 #include "esp_now.h"
-#include "WiFi.h"
+#include <WiFi.h>
+#include "esp_wifi.h"
 
-// Uncomment when the Edge Impulse model library is installed
-// #include <cat-identifier_inferencing.h>
+// ── WiFi (same as weight_node for ESP-NOW channel sync) ──────
+const char* WIFI_SSID = "MengqiPhone";
+const char* WIFI_PASS = "gaoxiangshibenben";
 
 // ── PIR ──────────────────────────────────────────────────────
-#define PIR_PIN          4       // GPIO4 = D3
-#define PIR_COOLDOWN_MS  5000   // minimum interval between triggers for the same visit
+#define PIR_PIN          2        // D1 (GPIO2)
+#define PIR_COOLDOWN_MS  10000
+#define PIR_WARMUP_MS    15000
 
-// ── Camera pins (fixed for XIAO ESP32S3 Sense) ───────────────
-#define PWDN_GPIO_NUM    -1
-#define RESET_GPIO_NUM   -1
-#define XCLK_GPIO_NUM    10
-#define SIOD_GPIO_NUM    40
-#define SIOC_GPIO_NUM    39
-#define Y9_GPIO_NUM      48
-#define Y8_GPIO_NUM      11
-#define Y7_GPIO_NUM      12
-#define Y6_GPIO_NUM      14
-#define Y5_GPIO_NUM      16
-#define Y4_GPIO_NUM      18
-#define Y3_GPIO_NUM      17
-#define Y2_GPIO_NUM      15
-#define VSYNC_GPIO_NUM   38
-#define HREF_GPIO_NUM    47
-#define PCLK_GPIO_NUM    13
+// ── Camera pins (XIAO ESP32S3 Sense) ─────────────────────────
+#define PWDN_GPIO_NUM  -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM  10
+#define SIOD_GPIO_NUM  40
+#define SIOC_GPIO_NUM  39
+#define Y9_GPIO_NUM    48
+#define Y8_GPIO_NUM    11
+#define Y7_GPIO_NUM    12
+#define Y6_GPIO_NUM    14
+#define Y5_GPIO_NUM    16
+#define Y4_GPIO_NUM    18
+#define Y3_GPIO_NUM    17
+#define Y2_GPIO_NUM    15
+#define VSYNC_GPIO_NUM 38
+#define HREF_GPIO_NUM  47
+#define PCLK_GPIO_NUM  13
 
-// ── Target MAC for ESP-NOW (fill in the Weight Node MAC) ─────
-// Flash weight_node first; it prints its MAC on the serial monitor — copy it here
-uint8_t weightNodeMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // broadcast for debugging
+#define CAM_COLS 320
+#define CAM_ROWS 240
 
-// ── ESP-NOW packet struct (must match weight_node) ───────────
-typedef struct {
-  uint8_t  cat_id;         // 0=Unknown  1=Wesley  2=Pupu
-  float    confidence;     // 0.0 ~ 1.0
-  uint32_t timestamp_ms;   // millis()
-  char     method[8];      // "CAM" or "WEIGHT"
-} CatIDPacket;
+// ── ESP-NOW ───────────────────────────────────────────────────
+uint8_t weightNodeMAC[] = {0x1C, 0xDB, 0xD4, 0x5C, 0x8D, 0xEC};
+typedef struct { uint8_t cat_id; float confidence; uint32_t timestamp_ms; char method[8]; } CatIDPacket;
 
-// ── State ─────────────────────────────────────────────────────
-enum CameraState { IDLE, CAT_DETECTED, COOLDOWN };
-CameraState camState = IDLE;
-
-unsigned long lastTriggerTime = 0;
-int photoCount = 0;
-
-// ── Forward declarations ──────────────────────────────────────
-bool initCamera();
-uint8_t runInference(camera_fb_t* fb, float* out_confidence);
-void sendCatID(uint8_t cat_id, float confidence);
-void onDataSent(const uint8_t* mac, esp_now_send_status_t status);
+// ── Globals ───────────────────────────────────────────────────
+static bool     cam_ok        = false;
+static int      lastPirState  = LOW;
+static unsigned long lastTriggerTime = 0;
+static int      photoCount    = 0;
+uint8_t*        snapshot_buf  = nullptr;  // PSRAM, reused each capture
 
 // ─────────────────────────────────────────────────────────────
-//  Camera initialization
+// EI camera get_data callback (exact copy from official example)
+// ─────────────────────────────────────────────────────────────
+static int ei_camera_get_data(size_t offset, size_t length, float* out_ptr) {
+    size_t pixel_ix   = offset * 3;
+    size_t out_ptr_ix = 0;
+    while (out_ptr_ix < length) {
+        out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16)
+                            + (snapshot_buf[pixel_ix + 1] <<  8)
+                            +  snapshot_buf[pixel_ix];
+        out_ptr_ix++;
+        pixel_ix += 3;
+    }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Camera init
 // ─────────────────────────────────────────────────────────────
 bool initCamera() {
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0       = Y2_GPIO_NUM;
-  config.pin_d1       = Y3_GPIO_NUM;
-  config.pin_d2       = Y4_GPIO_NUM;
-  config.pin_d3       = Y5_GPIO_NUM;
-  config.pin_d4       = Y6_GPIO_NUM;
-  config.pin_d5       = Y7_GPIO_NUM;
-  config.pin_d6       = Y8_GPIO_NUM;
-  config.pin_d7       = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;
-  config.pin_pclk     = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM;
-  config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;
-  config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    camera_config_t cfg;
+    cfg.ledc_channel  = LEDC_CHANNEL_0;
+    cfg.ledc_timer    = LEDC_TIMER_0;
+    cfg.pin_d0 = Y2_GPIO_NUM; cfg.pin_d1 = Y3_GPIO_NUM;
+    cfg.pin_d2 = Y4_GPIO_NUM; cfg.pin_d3 = Y5_GPIO_NUM;
+    cfg.pin_d4 = Y6_GPIO_NUM; cfg.pin_d5 = Y7_GPIO_NUM;
+    cfg.pin_d6 = Y8_GPIO_NUM; cfg.pin_d7 = Y9_GPIO_NUM;
+    cfg.pin_xclk      = XCLK_GPIO_NUM;
+    cfg.pin_pclk      = PCLK_GPIO_NUM;
+    cfg.pin_vsync     = VSYNC_GPIO_NUM;
+    cfg.pin_href      = HREF_GPIO_NUM;
+    cfg.pin_sccb_sda  = SIOD_GPIO_NUM;
+    cfg.pin_sccb_scl  = SIOC_GPIO_NUM;
+    cfg.pin_pwdn      = PWDN_GPIO_NUM;
+    cfg.pin_reset     = RESET_GPIO_NUM;
+    cfg.xclk_freq_hz  = 20000000;
+    cfg.pixel_format  = PIXFORMAT_JPEG;
+    cfg.frame_size    = FRAMESIZE_QVGA;
+    cfg.jpeg_quality  = 12;
+    cfg.fb_count      = 1;
+    cfg.fb_location   = CAMERA_FB_IN_PSRAM;
+    cfg.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
 
-  if (psramFound()) {
-    config.frame_size   = FRAMESIZE_QVGA;  // 320x240, matches model input size
-    config.jpeg_quality = 12;
-    config.fb_count     = 2;
-    config.fb_location  = CAMERA_FB_IN_PSRAM;
-  } else {
-    config.frame_size   = FRAMESIZE_QVGA;
-    config.jpeg_quality = 15;
-    config.fb_count     = 1;
-    config.fb_location  = CAMERA_FB_IN_DRAM;
-  }
-
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("[CAM] Init FAILED 0x%x\n", err);
-    return false;
-  }
-  Serial.println("[CAM] Init OK");
-  return true;
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Run cat inference on a captured frame
-//  Returns: 0=Unknown  1=Wesley  2=Pupu
-//  out_confidence: classification confidence 0~1
-// ─────────────────────────────────────────────────────────────
-uint8_t runInference(camera_fb_t* fb, float* out_confidence) {
-
-  /* ── Replace this block when the Edge Impulse library is installed ──────────
-  if (!fb) { *out_confidence = 0; return 0; }
-
-  // Convert JPEG frame to RGB888 for model input
-  uint8_t* rgb_buf = NULL;
-  size_t   rgb_len = 0;
-  bool ok = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, &rgb_buf, &rgb_len);
-  if (!ok || !rgb_buf) { *out_confidence = 0; return 0; }
-
-  // Build Edge Impulse signal
-  signal_t signal;
-  numpy::signal_from_buffer((float*)rgb_buf, EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT * 3, &signal);
-
-  ei_impulse_result_t result = { 0 };
-  EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
-  free(rgb_buf);
-
-  if (err != EI_IMPULSE_OK) { *out_confidence = 0; return 0; }
-
-  // Find the label with the highest confidence
-  float best = 0;
-  int   best_idx = 0;
-  for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    if (result.classification[i].value > best) {
-      best = result.classification[i].value;
-      best_idx = i;
+    if (esp_camera_init(&cfg) != ESP_OK) {
+        Serial.println("[CAM] Init FAILED");
+        return false;
     }
-  }
-  *out_confidence = best;
-  // Label order depends on your Edge Impulse project — map accordingly
-  if      (strcmp(result.classification[best_idx].label, "Wesley") == 0) return 1;
-  else if (strcmp(result.classification[best_idx].label, "Pupu")   == 0) return 2;
-  else return 0;
-  ────────────────────────────────────────────────────────────────────────── */
-
-  // Placeholder while model is not yet integrated — weight_node uses weight-based ID instead
-  *out_confidence = 0.0;
-  return 0;
+    Serial.println("[CAM] Init OK");
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────
-//  ESP-NOW send callback
+// Capture QVGA JPEG → RGB888 → crop to model input size
+// (same pattern as official EI esp32_camera example)
 // ─────────────────────────────────────────────────────────────
-void onDataSent(const uint8_t* mac, esp_now_send_status_t status) {
-  Serial.printf("[ESP-NOW] Send %s\n", status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+bool captureAndResize() {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { Serial.println("[CAM] Capture FAILED"); return false; }
+
+    bool ok = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
+    esp_camera_fb_return(fb);
+    if (!ok) { Serial.println("[CAM] fmt2rgb888 FAILED"); return false; }
+
+    // Crop+resize QVGA → model input (e.g. 96×96)
+    ei::image::processing::crop_and_interpolate_rgb888(
+        snapshot_buf, CAM_COLS, CAM_ROWS,
+        snapshot_buf, EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Pack and send cat identification result via ESP-NOW
+// Run EI inference, return cat_id (0=unknown,1=Wesley,2=Pupu)
 // ─────────────────────────────────────────────────────────────
-void sendCatID(uint8_t cat_id, float confidence) {
-  CatIDPacket pkt;
-  pkt.cat_id       = cat_id;
-  pkt.confidence   = confidence;
-  pkt.timestamp_ms = millis();
-  strncpy(pkt.method, "CAM", sizeof(pkt.method));
+uint8_t runInference(float* conf_out) {
+    *conf_out = 0.0f;
 
-  esp_now_send(weightNodeMAC, (uint8_t*)&pkt, sizeof(pkt));
+    ei::signal_t signal;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data     = &ei_camera_get_data;
 
-  const char* names[] = {"Unknown", "Wesley", "Pupu"};
-  Serial.printf("[CAM] Sent → cat=%s conf=%.2f\n", names[cat_id], confidence);
+    ei_impulse_result_t result = {0};
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
+    if (err != EI_IMPULSE_OK) {
+        Serial.printf("[EI] Classifier error %d\n", err);
+        return 0;
+    }
+
+    float best = 0; int bi = 0;
+    for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (result.classification[i].value > best) {
+            best = result.classification[i].value; bi = i;
+        }
+    }
+    *conf_out = best;
+    const char* label = result.classification[bi].label;
+    Serial.printf("[EI] label=%s conf=%.2f\n", label, best);
+
+    if (strcmp(label, "gungun") == 0) return 1;  // Wesley
+    if (strcmp(label, "pupu")   == 0) return 2;  // Pupu
+    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Setup
+// ESP-NOW
+// ─────────────────────────────────────────────────────────────
+void onDataSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
+    Serial.printf("[ESP-NOW] %s\n", status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+}
+
+void sendCatID(uint8_t cat_id, float conf) {
+    CatIDPacket pkt;
+    pkt.cat_id = cat_id; pkt.confidence = conf;
+    pkt.timestamp_ms = millis();
+    strncpy(pkt.method, "CAM", sizeof(pkt.method));
+    esp_now_send(weightNodeMAC, (uint8_t*)&pkt, sizeof(pkt));
+    const char* names[] = {"Unknown","Wesley","Pupu"};
+    Serial.printf("[CAM] Sent cat=%s conf=%.2f\n", names[cat_id], conf);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Setup
 // ─────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
-  delay(500);
+    Serial.begin(115200);
+    delay(300);
+    Serial.println("=== Camera Node ===");
 
-  Serial.println("=== Camera Node (ESP-NOW Sender) ===");
-  Serial.printf("[WiFi] MAC: %s\n", WiFi.macAddress().c_str());
+    if (!psramFound()) {
+        Serial.println("[WARN] PSRAM not found! Set Tools→PSRAM→OPI PSRAM");
+    }
 
-  // PIR
-  pinMode(PIR_PIN, INPUT);
-  Serial.println("[PIR] Ready on GPIO4");
-  delay(2000);  // PIR warm-up
+    // PIR warmup first
+    pinMode(PIR_PIN, INPUT);
+    lastPirState = digitalRead(PIR_PIN);
+    Serial.printf("[PIR] Warming up %d s...\n", PIR_WARMUP_MS / 1000);
+    delay(PIR_WARMUP_MS);
+    lastPirState = digitalRead(PIR_PIN);
+    Serial.println("[PIR] Ready");
 
-  // Camera
-  if (!initCamera()) {
-    Serial.println("[ERROR] Camera init failed");
-  }
+    // WiFi for ESP-NOW channel sync
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.print("[WiFi] Connecting");
+    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500); Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\n[WiFi] Ch=%d\n", WiFi.channel());
+    } else {
+        esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
+        Serial.println("\n[WiFi] FAILED, using Ch=6");
+    }
 
-  // ESP-NOW must be initialized in WiFi STA mode
-  WiFi.mode(WIFI_STA);
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("[ESP-NOW] Init FAILED");
-    return;
-  }
-  esp_now_register_send_cb(onDataSent);
+    // Camera
+    cam_ok = initCamera();
 
-  // Register peer (broadcast or specific MAC)
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, weightNodeMAC, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-  esp_now_add_peer(&peerInfo);
+    // Allocate snapshot buffer in PSRAM once (CAM_COLS × CAM_ROWS × RGB888)
+    snapshot_buf = (uint8_t*)heap_caps_malloc(
+        (size_t)CAM_COLS * CAM_ROWS * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!snapshot_buf) Serial.println("[CAM] snapshot_buf alloc FAILED");
 
-  Serial.println("[Ready] Waiting for motion...");
+    // ESP-NOW
+    if (esp_now_init() != ESP_OK) { Serial.println("[ESP-NOW] Init FAILED"); return; }
+    esp_now_register_send_cb(onDataSent);
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, weightNodeMAC, 6);
+    peer.channel = 6; peer.encrypt = false;
+    esp_now_add_peer(&peer);
+
+    Serial.println("[Ready] Waiting for motion...");
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Loop — PIR state machine
+// Loop
 // ─────────────────────────────────────────────────────────────
 void loop() {
-  int pirVal = digitalRead(PIR_PIN);
-  unsigned long now = millis();
+    int cur = digitalRead(PIR_PIN);
+    unsigned long now = millis();
 
-  switch (camState) {
+    if (cur == HIGH && lastPirState == LOW) {
+        if (now - lastTriggerTime > PIR_COOLDOWN_MS) {
+            lastTriggerTime = now;
+            photoCount++;
+            Serial.printf("\n[PIR] Motion #%d\n", photoCount);
 
-    case IDLE:
-      if (pirVal == HIGH) {
-        camState = CAT_DETECTED;
-        lastTriggerTime = now;
-        photoCount++;
-        Serial.printf("\n[PIR] Motion! Photo #%d\n", photoCount);
-
-        camera_fb_t* fb = esp_camera_fb_get();
-        if (!fb) {
-          Serial.println("[CAM] Capture FAILED");
-          camState = COOLDOWN;
-          break;
+            if (cam_ok && snapshot_buf && captureAndResize()) {
+                float conf = 0;
+                uint8_t cat_id = runInference(&conf);
+                sendCatID(cat_id, conf);
+            }
+        } else {
+            Serial.println("[PIR] Cooldown");
         }
+    }
 
-        float conf = 0;
-        uint8_t cat_id = runInference(fb, &conf);
-        esp_camera_fb_return(fb);
-
-        Serial.printf("[CAM] Inference: cat=%d conf=%.2f\n", cat_id, conf);
-        sendCatID(cat_id, conf);
-
-        camState = COOLDOWN;
-      }
-      break;
-
-    case CAT_DETECTED:
-      // Capture and inference are handled synchronously in the IDLE case — jump to COOLDOWN
-      camState = COOLDOWN;
-      break;
-
-    case COOLDOWN:
-      if (now - lastTriggerTime > PIR_COOLDOWN_MS) {
-        camState = IDLE;
-        Serial.println("[PIR] Cooldown over, ready.");
-      }
-      break;
-  }
-
-  delay(50);
+    lastPirState = cur;
+    delay(50);
 }
+
+#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
+#error "Invalid model for current sensor — check Edge Impulse model type"
+#endif

@@ -3,5 +3,9 @@
 
 HX711_ADC by Olav Kallhovd (latest version)
 
+# Edge Impulse (camera node): install cat-litter-box_inferencing, then once:
+#   bash code/camera_node/patch_ei_arena.sh
+# Rebuild sketch after patching (arena 300000 B in PSRAM).
+
 # Built-in libraries (no installation needed):
 # EEPROM  — included with ESP32 Arduino core
