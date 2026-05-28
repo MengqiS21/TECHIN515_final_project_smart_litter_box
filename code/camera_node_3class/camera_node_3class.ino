@@ -1,30 +1,29 @@
 /*
- * Smart Cat Litter Box — Camera Node
+ * Smart Cat Litter Box — Camera Node (3-class model)
  * Board : XIAO ESP32S3 Sense  |  PSRAM: OPI PSRAM  |  115200 baud
  *
- * PIR (D1/GPIO2) detects motion → capture photo → EI inference → send via ESP-NOW
- * Based on Edge Impulse official esp32_camera example
+ * Model labels: "empty", "gungun" (=Wesley), "pupu" (=Pupu)
+ * All three classes distinguished by camera; Wesley displays as "Wesley" everywhere.
  */
 
 #include "esp_heap_caps.h"
 
-// Override weak ei_calloc: direct ALL EI memory (tensor arena + overflow buffers)
-// to PSRAM so DRAM is not exhausted during inference.
-// ei_free stays as-is (free() handles both DRAM and PSRAM on ESP32).
+// Override weak ei_calloc: route all EI memory to PSRAM to avoid DRAM exhaustion.
 extern "C" void* ei_calloc(size_t nitems, size_t size) {
     void* p = heap_caps_calloc(nitems, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!p) p = heap_caps_calloc(nitems, size, MALLOC_CAP_DEFAULT);
     return p;
 }
 
-#include <catIdentifierNew_inferencing.h>
+// ★ Replace with the actual header name of your 3-class model library
+#include <cat_litterbox_model.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
 #include "esp_now.h"
 #include <WiFi.h>
 #include "esp_wifi.h"
 
-// ── WiFi (same as weight_node for ESP-NOW channel sync) ──────
+// ── WiFi ─────────────────────────────────────────────────────
 const char* WIFI_SSID = "MengqiPhone";
 const char* WIFI_PASS = "gaoxiangshibenben";
 
@@ -59,15 +58,13 @@ uint8_t weightNodeMAC[] = {0x1C, 0xDB, 0xD4, 0x5C, 0x8D, 0xEC};
 typedef struct { uint8_t cat_id; float confidence; uint32_t timestamp_ms; char method[8]; } CatIDPacket;
 
 // ── Globals ───────────────────────────────────────────────────
-static bool     cam_ok        = false;
-static int      lastPirState  = LOW;
+static bool          cam_ok       = false;
+static int           lastPirState = LOW;
 static unsigned long lastTriggerTime = 0;
-static int      photoCount    = 0;
-uint8_t*        snapshot_buf  = nullptr;  // PSRAM, reused each capture
+static int           photoCount   = 0;
+uint8_t*             snapshot_buf = nullptr;
 
-// ─────────────────────────────────────────────────────────────
-// EI camera get_data callback (exact copy from official example)
-// ─────────────────────────────────────────────────────────────
+// ── EI signal callback ────────────────────────────────────────
 static int ei_camera_get_data(size_t offset, size_t length, float* out_ptr) {
     size_t pixel_ix   = offset * 3;
     size_t out_ptr_ix = 0;
@@ -81,63 +78,45 @@ static int ei_camera_get_data(size_t offset, size_t length, float* out_ptr) {
     return 0;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Camera init
-// ─────────────────────────────────────────────────────────────
+// ── Camera init ───────────────────────────────────────────────
 bool initCamera() {
     camera_config_t cfg;
-    cfg.ledc_channel  = LEDC_CHANNEL_0;
-    cfg.ledc_timer    = LEDC_TIMER_0;
+    cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
     cfg.pin_d0 = Y2_GPIO_NUM; cfg.pin_d1 = Y3_GPIO_NUM;
     cfg.pin_d2 = Y4_GPIO_NUM; cfg.pin_d3 = Y5_GPIO_NUM;
     cfg.pin_d4 = Y6_GPIO_NUM; cfg.pin_d5 = Y7_GPIO_NUM;
     cfg.pin_d6 = Y8_GPIO_NUM; cfg.pin_d7 = Y9_GPIO_NUM;
-    cfg.pin_xclk      = XCLK_GPIO_NUM;
-    cfg.pin_pclk      = PCLK_GPIO_NUM;
-    cfg.pin_vsync     = VSYNC_GPIO_NUM;
-    cfg.pin_href      = HREF_GPIO_NUM;
-    cfg.pin_sccb_sda  = SIOD_GPIO_NUM;
-    cfg.pin_sccb_scl  = SIOC_GPIO_NUM;
-    cfg.pin_pwdn      = PWDN_GPIO_NUM;
-    cfg.pin_reset     = RESET_GPIO_NUM;
-    cfg.xclk_freq_hz  = 20000000;
-    cfg.pixel_format  = PIXFORMAT_JPEG;
-    cfg.frame_size    = FRAMESIZE_QVGA;
-    cfg.jpeg_quality  = 12;
-    cfg.fb_count      = 1;
-    cfg.fb_location   = CAMERA_FB_IN_PSRAM;
-    cfg.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
-
-    if (esp_camera_init(&cfg) != ESP_OK) {
-        Serial.println("[CAM] Init FAILED");
-        return false;
-    }
+    cfg.pin_xclk = XCLK_GPIO_NUM; cfg.pin_pclk = PCLK_GPIO_NUM;
+    cfg.pin_vsync = VSYNC_GPIO_NUM; cfg.pin_href = HREF_GPIO_NUM;
+    cfg.pin_sccb_sda = SIOD_GPIO_NUM; cfg.pin_sccb_scl = SIOC_GPIO_NUM;
+    cfg.pin_pwdn = PWDN_GPIO_NUM; cfg.pin_reset = RESET_GPIO_NUM;
+    cfg.xclk_freq_hz = 20000000;
+    cfg.pixel_format = PIXFORMAT_JPEG;
+    cfg.frame_size   = FRAMESIZE_QVGA;
+    cfg.jpeg_quality = 12;
+    cfg.fb_count     = 1;
+    cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+    cfg.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    if (esp_camera_init(&cfg) != ESP_OK) { Serial.println("[CAM] Init FAILED"); return false; }
     Serial.println("[CAM] Init OK");
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Capture QVGA JPEG → RGB888 → crop to model input size
-// (same pattern as official EI esp32_camera example)
-// ─────────────────────────────────────────────────────────────
+// ── Capture + resize ──────────────────────────────────────────
 bool captureAndResize() {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) { Serial.println("[CAM] Capture FAILED"); return false; }
-
     bool ok = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
     esp_camera_fb_return(fb);
     if (!ok) { Serial.println("[CAM] fmt2rgb888 FAILED"); return false; }
-
-    // Crop+resize QVGA → model input (e.g. 96×96)
     ei::image::processing::crop_and_interpolate_rgb888(
         snapshot_buf, CAM_COLS, CAM_ROWS,
         snapshot_buf, EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Run EI inference, return cat_id (0=unknown,1=Wesley,2=Pupu)
-// ─────────────────────────────────────────────────────────────
+// ── Inference ─────────────────────────────────────────────────
+// Labels: "empty"=0, "gungun"=Wesley=1, "pupu"=Pupu=2
 uint8_t runInference(float* conf_out) {
     *conf_out = 0.0f;
 
@@ -160,16 +139,17 @@ uint8_t runInference(float* conf_out) {
     }
     *conf_out = best;
     const char* label = result.classification[bi].label;
-    Serial.printf("[EI] label=%s conf=%.2f\n", label, best);
+    // Display "Wesley" for gungun label
+    const char* display = (strcasecmp(label, "gungun") == 0) ? "Wesley" : label;
+    Serial.printf("[EI] label=%s conf=%.2f\n", display, best);
 
-    if (strcasecmp(label, "pupu")  == 0 && best > 0.7f) return 2;  // Pupu
-    if (strcasecmp(label, "empty") == 0 && best > 0.7f) return 0;  // empty → weight fallback
-    return 1;  // Wesley (neither label is high-confidence)
+    if (best <= 0.7f)                          return 0;  // low confidence → weight fallback
+    if (strcasecmp(label, "gungun") == 0)      return 1;  // Wesley
+    if (strcasecmp(label, "pupu")   == 0)      return 2;  // Pupu
+    return 0;                                              // empty → weight fallback
 }
 
-// ─────────────────────────────────────────────────────────────
-// ESP-NOW
-// ─────────────────────────────────────────────────────────────
+// ── ESP-NOW ───────────────────────────────────────────────────
 
 void sendCatID(uint8_t cat_id, float conf) {
     CatIDPacket pkt;
@@ -177,23 +157,18 @@ void sendCatID(uint8_t cat_id, float conf) {
     pkt.timestamp_ms = millis();
     strncpy(pkt.method, "CAM", sizeof(pkt.method));
     esp_now_send(weightNodeMAC, (uint8_t*)&pkt, sizeof(pkt));
-    const char* names[] = {"Unknown","Wesley","Pupu"};
+    const char* names[] = {"Unknown", "Wesley", "Pupu"};
     Serial.printf("[CAM] Sent cat=%s conf=%.2f\n", names[cat_id], conf);
 }
 
-// ─────────────────────────────────────────────────────────────
-// Setup
-// ─────────────────────────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
     delay(300);
-    Serial.println("=== Camera Node ===");
+    Serial.println("=== Camera Node (3-class) ===");
 
-    if (!psramFound()) {
-        Serial.println("[WARN] PSRAM not found! Set Tools→PSRAM→OPI PSRAM");
-    }
+    if (!psramFound()) Serial.println("[WARN] PSRAM not found! Set Tools→PSRAM→OPI PSRAM");
 
-    // PIR warmup first
     pinMode(PIR_PIN, INPUT);
     lastPirState = digitalRead(PIR_PIN);
     Serial.printf("[PIR] Warming up %d s...\n", PIR_WARMUP_MS / 1000);
@@ -201,7 +176,6 @@ void setup() {
     lastPirState = digitalRead(PIR_PIN);
     Serial.println("[PIR] Ready");
 
-    // WiFi for ESP-NOW channel sync
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("[WiFi] Connecting");
@@ -215,30 +189,25 @@ void setup() {
         Serial.println("\n[WiFi] FAILED, using Ch=6");
     }
 
-    // Camera
     cam_ok = initCamera();
 
-    // Allocate snapshot buffer in PSRAM once (CAM_COLS × CAM_ROWS × RGB888)
     snapshot_buf = (uint8_t*)heap_caps_malloc(
         (size_t)CAM_COLS * CAM_ROWS * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!snapshot_buf) Serial.println("[CAM] snapshot_buf alloc FAILED");
 
-    // ESP-NOW
     if (esp_now_init() != ESP_OK) { Serial.println("[ESP-NOW] Init FAILED"); return; }
     esp_now_register_send_cb([](const wifi_tx_info_t* info, esp_now_send_status_t st) {
         Serial.printf("[ESP-NOW] %s\n", st == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
     });
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, weightNodeMAC, 6);
-    peer.channel = 0; peer.encrypt = false;  // 0 = follow current WiFi channel
+    peer.channel = 0; peer.encrypt = false;
     esp_now_add_peer(&peer);
 
     Serial.println("[Ready] Waiting for motion...");
 }
 
-// ─────────────────────────────────────────────────────────────
-// Loop
-// ─────────────────────────────────────────────────────────────
+// ── Loop ──────────────────────────────────────────────────────
 void loop() {
     int cur = digitalRead(PIR_PIN);
     unsigned long now = millis();
@@ -248,7 +217,6 @@ void loop() {
             lastTriggerTime = now;
             photoCount++;
             Serial.printf("\n[PIR] Motion #%d\n", photoCount);
-
             if (cam_ok && snapshot_buf && captureAndResize()) {
                 float conf = 0;
                 uint8_t cat_id = runInference(&conf);

@@ -31,3 +31,4 @@ Thumbs.db
 
 # ── Large binaries (optional: remove line if you want this in Git / use Git LFS) ──
 data/*.zip
+.gstack/
