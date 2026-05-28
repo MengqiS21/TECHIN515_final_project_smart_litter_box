@@ -16,7 +16,7 @@ extern "C" void* ei_calloc(size_t nitems, size_t size) {
 }
 
 // ★ Replace with the actual header name of your 3-class model library
-#include <cat_litterbox_model.h>
+#include <catIdentifierBig.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
 #include "esp_now.h"
