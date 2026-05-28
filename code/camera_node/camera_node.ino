@@ -6,7 +6,7 @@
  * Based on Edge Impulse official esp32_camera example
  */
 
-#include <cat_litterbox_model.h>
+#include <catIdentifier_inferencing.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 #include "esp_camera.h"
 #include "esp_now.h"
@@ -151,9 +151,8 @@ uint8_t runInference(float* conf_out) {
     const char* label = result.classification[bi].label;
     Serial.printf("[EI] label=%s conf=%.2f\n", label, best);
 
-    if (strcmp(label, "gungun") == 0) return 1;  // Wesley
-    if (strcmp(label, "pupu")   == 0) return 2;  // Pupu
-    return 0;
+    if (strcmp(label, "pupu") == 0) return 2;  // Pupu confirmed by camera
+    return 0;  // "empty" or low-confidence → weight_node uses weight to ID Wesley
 }
 
 // ─────────────────────────────────────────────────────────────
