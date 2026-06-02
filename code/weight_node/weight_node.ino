@@ -29,6 +29,11 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include "esp_now.h"
+#include "esp_wifi.h"
+
+#ifndef WIFI_FALLBACK_CHANNEL
+#define WIFI_FALLBACK_CHANNEL 6  // match camera_node_3class when both fail WiFi
+#endif
 
 // ── ★ Fill in your WiFi credentials and PC's local IP ────────
 const char* WIFI_SSID   = "MengqiPhone";
@@ -60,8 +65,10 @@ typedef struct {
 } CatIDPacket;
 
 // ── Visit detection thresholds (grams) ───────────────────────
-const float CAT_ENTER_THRESHOLD_G = 2000.0;
-const float CAT_EXIT_THRESHOLD_G  = 300.0;
+// netWeight = reading - baseline. UI ~700–800 g spikes need enter threshold below that.
+// (2000 g was for full litter+猫; too high for current scale readings.)
+const float CAT_ENTER_THRESHOLD_G = 400.0;
+const float CAT_EXIT_THRESHOLD_G  = 150.0;
 const int   STABLE_MS             = 2000;
 const int   POST_EXIT_WAIT_MS     = 3000;
 
@@ -145,15 +152,17 @@ void updateBaseline(float r) {
 
 // ── ESP-NOW receive buffer ────────────────────────────────────
 volatile bool camPktReady = false;
+volatile bool camPktNotify = false;
 CatIDPacket   latestCamPkt;
 unsigned long camPktTime  = 0;
-const int     CAM_PKT_VALID_MS = 10000;
+const int     CAM_PKT_VALID_MS = 45000;  // PIR may fire before cat steps on scale
 
 void IRAM_ATTR onDataReceived(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (len == sizeof(CatIDPacket)) {
     memcpy((void*)&latestCamPkt, data, sizeof(CatIDPacket));
     camPktTime  = millis();
     camPktReady = true;
+    camPktNotify = true;
   }
 }
 
@@ -163,18 +172,56 @@ PubSubClient mqtt(espClient);
 unsigned long lastWeightMs = 0;
 unsigned long lastReconnMs = 0;
 
-void connectWiFi() {
-  Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-    delay(500); Serial.print(".");
+static void wifiScanForSsid(const char* ssid) {
+  int n = WiFi.scanNetworks(false, true);
+  Serial.printf("[WiFi] Scan: %d networks", n);
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == ssid) {
+      found = true;
+      Serial.printf(" | \"%s\" Ch=%d RSSI=%d", ssid, WiFi.channel(i), WiFi.RSSI(i));
+    }
   }
-  if (WiFi.status() == WL_CONNECTED) {
+  Serial.println(found ? "" : " | hotspot NOT seen (turn on hotspot, 2.4GHz)");
+  WiFi.scanDelete();
+}
+
+static bool wifiConnectStation(const char* ssid, const char* pass, int tries) {
+  WiFi.setSleep(false);
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.begin(ssid, pass);
+  Serial.printf("[WiFi] Connecting to %s", ssid);
+  for (int i = 0; i < tries && WiFi.status() != WL_CONNECTED; i++) {
+    delay(500);
+    Serial.print(".");
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void connectWiFi() {
+  const int tries = 60;  // 30 s
+  bool ok = wifiConnectStation(WIFI_SSID, WIFI_PASS, tries);
+  if (!ok) {
+    Serial.println("\n[WiFi] Retry once...");
+    ok = wifiConnectStation(WIFI_SSID, WIFI_PASS, tries);
+  }
+  if (ok) {
     Serial.printf("\n[WiFi] Connected! IP=%s  Ch=%d\n",
       WiFi.localIP().toString().c_str(), WiFi.channel());
     Serial.printf("[WiFi] MAC: %s\n", WiFi.macAddress().c_str());
+    Serial.printf("[WiFi] Camera ESP-NOW needs same Ch=%d\n", WiFi.channel());
   } else {
-    Serial.println("\n[WiFi] FAILED — running without MQTT");
+    wl_status_t st = WiFi.status();
+    Serial.printf("\n[WiFi] FAILED (status=%d) — no MQTT", (int)st);
+    if (st == WL_NO_SSID_AVAIL) Serial.print(" NO_SSID");
+    else if (st == WL_CONNECT_FAILED) Serial.print(" AUTH_FAIL");
+    else if (st == WL_DISCONNECTED) Serial.print(" DISCONNECTED");
+    Serial.println();
+    wifiScanForSsid(WIFI_SSID);
+    esp_wifi_set_channel(WIFI_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("[WiFi] ESP-NOW fallback Ch=%d (match camera WIFI_FALLBACK_CHANNEL)\n",
+                  WIFI_FALLBACK_CHANNEL);
   }
 }
 
@@ -285,6 +332,15 @@ void setup() {
 //  Loop
 // ─────────────────────────────────────────────────────────────
 void loop() {
+  // Retry WiFi if hotspot was off at boot (every 30 s)
+  static unsigned long lastWifiRetryMs = 0;
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiRetryMs > 30000) {
+    lastWifiRetryMs = millis();
+    Serial.println("[WiFi] Retrying...");
+    connectWiFi();
+    if (WiFi.status() == WL_CONNECTED) connectMQTT();
+  }
+
   // MQTT keepalive + reconnect
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqtt.connected()) {
@@ -292,6 +348,16 @@ void loop() {
       if (now - lastReconnMs > 5000) { lastReconnMs = now; connectMQTT(); }
     }
     mqtt.loop();
+  }
+
+  if (camPktNotify) {
+    camPktNotify = false;
+    const char* names[] = {"Unknown", "Wesley", "Pupu"};
+    uint8_t id = latestCamPkt.cat_id;
+    if (id > 2) id = 0;
+    Serial.printf("[ESP-NOW] RX cat=%s conf=%.2f (valid %lu s for next visit)\n",
+                  names[id], latestCamPkt.confidence,
+                  (unsigned long)(CAM_PKT_VALID_MS / 1000));
   }
 
   if (!LoadCell.update()) return;
@@ -330,7 +396,8 @@ void loop() {
         visitState    = ENTERING;
         stableStartMs = now;
         curVisit      = {now, 0, currentBaseline, reading, 0, 0, 0};
-        Serial.println("[VISIT] Entering...");
+        Serial.printf("[VISIT] Entering... net=%.0f g (need >%.0f)\n",
+                      netWeight, CAT_ENTER_THRESHOLD_G);
       }
       break;
 
@@ -343,6 +410,10 @@ void loop() {
             curVisit.cat_id = latestCamPkt.cat_id;
             curVisit.cam_confidence = latestCamPkt.confidence;
             camPktReady = false;
+            Serial.printf("[VISIT] Using camera cat_id=%d conf=%.2f\n",
+                          curVisit.cat_id, curVisit.cam_confidence);
+          } else {
+            Serial.println("[VISIT] No recent camera packet — will use weight ID");
           }
           Serial.printf("[VISIT] Occupied — peak=%.1fg\n", curVisit.peak_weight_g);
         }

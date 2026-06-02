@@ -78,11 +78,32 @@ def get_state():
         "weight_buf":      deque(maxlen=MAX_POINTS),
         "time_buf":        deque(maxlen=MAX_POINTS),
         "visits_buf":      deque(maxlen=50),   # real visit records from litterbox/visits
+        "visit_payloads":  set(),            # raw JSON dedup (multi MQTT thread guard)
+        "mqtt_running":    False,
         "lock":            threading.Lock(),
         "stop_event":      threading.Event(),
         "mqtt_client":     None,
         "tare_baseline_g": None,
     }
+
+
+def dedupe_visits(visits):
+    """Last line of defense if the same visit was appended twice."""
+    seen = set()
+    out = []
+    for v in visits:
+        key = (
+            v.get("entry_ms"),
+            v.get("exit_ms"),
+            v.get("cat_id"),
+            v.get("method"),
+            round(float(v.get("cat_weight_g", 0)), 1),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
 
 # ─────────────────────────────────────────────────────────────
 #  MQTT background reader
@@ -127,9 +148,17 @@ def mqtt_reader(broker: str, port: int = 1883):
             try:
                 import json
                 record = json.loads(payload)
-                record["_time"] = datetime.now().strftime("%H:%M:%S")
+                now = datetime.now()
+                record["_time"] = now.strftime("%H:%M:%S")
+                record["_received_at"] = now
                 with state["lock"]:
-                    state["visits_buf"].appendleft(record)  # newest first
+                    if payload in state["visit_payloads"]:
+                        return
+                    state["visit_payloads"].add(payload)
+                    if len(state["visit_payloads"]) > 200:
+                        state["visit_payloads"].clear()
+                        state["visit_payloads"].add(payload)
+                    state["visits_buf"].appendleft(record)
             except Exception:
                 pass
 
@@ -155,17 +184,24 @@ def mqtt_reader(broker: str, port: int = 1883):
             state["mqtt_error"] = str(e)
     finally:
         with state["lock"]:
-            state["connected"]   = False
-            state["mqtt_client"] = None
+            state["connected"]    = False
+            state["mqtt_client"]  = None
+            state["mqtt_running"] = False
 
 
 def start_mqtt(broker: str):
     state = get_state()
+    if state["mqtt_running"]:
+        state["stop_event"].set()
+        time.sleep(0.8)
     state["stop_event"].set()
-    time.sleep(0.3)
+    time.sleep(0.5)
     state["stop_event"].clear()
     with state["lock"]:
         state["tare_baseline_g"] = None
+        state["visits_buf"].clear()
+        state["visit_payloads"].clear()
+        state["mqtt_running"] = True
     threading.Thread(target=mqtt_reader, args=(broker,), daemon=True).start()
 
 
@@ -207,42 +243,117 @@ def net_series_for_chart(weights, baseline):
     return [max(0.0, w - baseline) for w in weights]
 
 
-# ── Placeholder data helpers ──────────────────────────────────
-def make_visit_history():
-    rng  = np.random.default_rng(42)
-    cats = ["Wesley", "Pupu"]
-    rows = []
-    base = datetime.now()
-    for i in range(10):
-        cat        = cats[i % 2]
-        visit_time = base - timedelta(minutes=15 * (i + 1))
-        weight     = rng.integers(3900, 5200)
-        duration   = round(rng.uniform(1.5, 5.5), 1)
-        status     = "⚠️ Anomaly" if (i == 2 or i == 7) else "✅ Normal"
-        rows.append({"Time": visit_time.strftime("%H:%M"), "Cat": cat,
-                     "Weight (g)": weight, "Duration (min)": duration, "Status": status})
-    return pd.DataFrame(rows)
+# ── Health trends & alerts from real MQTT visits ───────────────
+TREND_DAYS = 14
+VISITS_PER_DAY_WARN = 6
+DURATION_WARN_S = 180.0
+LOW_WEIGHT_WARN_G = 200.0
+HIGH_EXCREMENT_WARN_G = 500.0
 
-def make_daily_weight():
-    rng    = np.random.default_rng(7)
-    dates  = [datetime.now() - timedelta(days=i) for i in range(13, -1, -1)]
-    labels = [d.strftime("%m/%d") for d in dates]
-    return pd.DataFrame({"Date": labels,
-                         "Wesley (g)": 4300 + rng.integers(-150, 200, 14),
-                         "Pupu (g)":   4700 + rng.integers(-120, 180, 14)})
 
-def make_daily_visits():
-    rng    = np.random.default_rng(13)
-    dates  = [datetime.now() - timedelta(days=i) for i in range(13, -1, -1)]
-    labels = [d.strftime("%m/%d") for d in dates]
-    return pd.DataFrame({"Date": labels,
-                         "Wesley": rng.integers(2, 6, 14),
-                         "Pupu":   rng.integers(1, 5, 14)})
+def _visit_timestamp(v):
+    at = v.get("_received_at")
+    if isinstance(at, datetime):
+        return at
+    return datetime.now()
 
-def visit_history_status_style(val):
-    if "Anomaly" in val:
-        return "background-color: #FFF7ED; color: #92400E; font-weight: 700;"
-    return ""
+
+def build_daily_trends_from_visits(visits, days=TREND_DAYS):
+    """Aggregate litterbox/visits from this session into daily charts."""
+    today = datetime.now().date()
+    date_list = [today - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    labels = [d.strftime("%m/%d") for d in date_list]
+
+    w_w, p_w = {d: [] for d in date_list}, {d: [] for d in date_list}
+    w_c, p_c = {d: 0 for d in date_list}, {d: 0 for d in date_list}
+
+    for v in dedupe_visits(visits):
+        d = _visit_timestamp(v).date()
+        if d not in w_c:
+            continue
+        cat = v.get("cat", "")
+        cw = float(v.get("cat_weight_g", 0) or 0)
+        if cat == "Wesley":
+            w_c[d] += 1
+            if cw > 0:
+                w_w[d].append(cw)
+        elif cat == "Pupu":
+            p_c[d] += 1
+            if cw > 0:
+                p_w[d].append(cw)
+
+    def day_avg(bucket):
+        return round(sum(bucket) / len(bucket), 0) if bucket else np.nan
+
+    return pd.DataFrame({
+        "Date": labels,
+        "Wesley (g)": [day_avg(w_w[d]) for d in date_list],
+        "Pupu (g)": [day_avg(p_w[d]) for d in date_list],
+        "Wesley": [w_c[d] for d in date_list],
+        "Pupu": [p_c[d] for d in date_list],
+    })
+
+
+def build_health_alerts_from_visits(visits):
+    """Rule-based flags from real visit records (current MQTT session)."""
+    visits = dedupe_visits(visits)
+    now = datetime.now()
+    alerts = []
+
+    if not visits:
+        return [("ℹ️", now.strftime("%Y-%m-%d %H:%M"),
+                 "No visits yet this session — trends and alerts update after each litterbox visit.")]
+
+    today = now.date()
+    today_visits = [v for v in visits if _visit_timestamp(v).date() == today]
+
+    for cat in ("Wesley", "Pupu"):
+        n = sum(1 for v in today_visits if v.get("cat") == cat)
+        if n >= VISITS_PER_DAY_WARN:
+            alerts.append(("⚠️", now.strftime("%Y-%m-%d %H:%M"),
+                           f"{cat} visited {n} times today (session) — above typical 2–4/day."))
+
+    for v in visits[:12]:
+        cat = v.get("cat", "Unknown")
+        ts = _visit_timestamp(v).strftime("%Y-%m-%d %H:%M")
+        dur = float(v.get("duration_s", 0) or 0)
+        conf = float(v.get("conf", 0) or 0)
+        cw = float(v.get("cat_weight_g", 0) or 0)
+        exc = float(v.get("excrement_g", 0) or 0)
+        method = v.get("method", "")
+
+        if dur >= DURATION_WARN_S:
+            alerts.append(("ℹ️", ts,
+                           f"{cat}: long visit ({dur / 60:.1f} min)."))
+        if 0 < conf < 0.6:
+            alerts.append(("⚠️", ts,
+                           f"{cat}: low identification confidence ({conf * 100:.0f}%)."))
+        if 0 < cw < LOW_WEIGHT_WARN_G:
+            alerts.append(("⚠️", ts,
+                           f"{cat}: cat weight only {cw:.0f} g — check scale / calibration."))
+        if exc >= HIGH_EXCREMENT_WARN_G:
+            alerts.append(("ℹ️", ts,
+                           f"{cat}: large baseline shift (+{exc:.0f} g) — litter added or re-tare."))
+        if method == "WEIGHT" and cat in ("Wesley", "Pupu"):
+            alerts.append(("ℹ️", ts,
+                           f"{cat}: identified by weight only (camera missed or low conf)."))
+
+    # Weight trend: compare last two visits per cat
+    for cat in ("Wesley", "Pupu"):
+        cat_visits = [v for v in visits if v.get("cat") == cat and float(v.get("cat_weight_g", 0) or 0) > 0]
+        if len(cat_visits) >= 2:
+            w0 = float(cat_visits[0].get("cat_weight_g", 0))
+            w1 = float(cat_visits[1].get("cat_weight_g", 0))
+            drop = w1 - w0
+            if drop <= -200:
+                alerts.append(("⚠️", _visit_timestamp(cat_visits[0]).strftime("%Y-%m-%d %H:%M"),
+                               f"{cat}: weight down {abs(drop):.0f} g vs previous visit in this session."))
+
+    if not alerts:
+        alerts.append(("✅", now.strftime("%Y-%m-%d %H:%M"),
+                       "No anomalies in recorded visits this session."))
+
+    return alerts[:10]
 
 
 # ── Sidebar ───────────────────────────────────────────────────
@@ -250,8 +361,8 @@ with st.sidebar:
     st.markdown("### Connection")
     broker_ip = st.text_input(
         "MQTT Broker IP",
-        value="localhost",
-        help="Your Mac's local IP, e.g. 192.168.1.x  (run: ipconfig getifaddr en0)"
+        value="broker.hivemq.com",
+        help="Public broker (matches weight_node.ino). Use localhost only if you run Mosquitto on this Mac."
     )
 
     col1, col2 = st.columns(2)
@@ -267,8 +378,11 @@ with st.sidebar:
         state = get_state()
         state["stop_event"].set()
         with state["lock"]:
-            state["connected"]      = False
+            state["connected"]       = False
+            state["mqtt_running"]    = False
             state["tare_baseline_g"] = None
+            state["visits_buf"].clear()
+            state["visit_payloads"].clear()
 
     state = get_state()
     with state["lock"]:
@@ -338,45 +452,16 @@ st.markdown('<div class="section-title">📋 Visit History</div>', unsafe_allow_
 visit_history_slot = st.empty()
 st.divider()
 
-# ── Section 4: Health Trends (placeholder) ───────────────────
+# ── Section 4–5: Health Trends & Alerts (live MQTT visits) ───
 st.markdown('<div class="section-title">📈 Health Trends</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-sub">14-day overview — placeholder data</div>', unsafe_allow_html=True)
-col_w, col_v = st.columns(2)
-weight_df = make_daily_weight()
-visits_df = make_daily_visits()
-with col_w:
-    st.markdown("**Daily Average Weight (g)**")
-    st.line_chart(weight_df.set_index("Date")[["Wesley (g)", "Pupu (g)"]],
-                  color=["#7C6BB5", "#E88FB4"], use_container_width=True, height=240)
-with col_v:
-    st.markdown("**Daily Visit Count**")
-    st.line_chart(visits_df.set_index("Date")[["Wesley", "Pupu"]],
-                  color=["#7C6BB5", "#E88FB4"], use_container_width=True, height=240)
-st.markdown("""
-<div style="font-size:13px; color:#7A7490; margin-top:8px; display:flex; gap:18px; flex-wrap:wrap;">
-  <span style="display:flex; align-items:center; gap:7px;">
-    <span style="width:11px; height:11px; border-radius:999px; background:#7C6BB5; display:inline-block;"></span>
-    <span style="color:#2A2440;">Wesley</span></span>
-  <span style="display:flex; align-items:center; gap:7px;">
-    <span style="width:11px; height:11px; border-radius:999px; background:#E88FB4; display:inline-block;"></span>
-    <span style="color:#2A2440;">Pupu</span></span>
-</div>""", unsafe_allow_html=True)
+health_sub_slot = st.empty()
+health_charts_slot = st.empty()
+health_legend_slot = st.empty()
 st.divider()
 
-# ── Section 5: Anomaly Alerts (placeholder) ──────────────────
 st.markdown('<div class="section-title">🚨 Anomaly Alerts</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-sub">Recent health flags — placeholder data</div>', unsafe_allow_html=True)
-alerts = [
-    ("⚠️", "2026-05-08 09:14", "Wesley's weight dropped 210 g over the last 3 days. Consider a vet check-up."),
-    ("⚠️", "2026-05-07 18:02", "Pupu visited 6 times yesterday — above the normal baseline of 2–4 visits/day."),
-    ("ℹ️", "2026-05-06 11:45", "Wesley's average visit duration increased to 5.2 min (baseline: 3.1 min)."),
-    ("✅", "2026-05-05 08:30", "All metrics normal for both cats today."),
-]
-for icon, ts, msg in alerts:
-    st.markdown(f"""<div class="alert-row">
-      <span class="alert-icon">{icon}</span>
-      <b style="font-size:11px; color:#7A7490;">{ts}</b><br>{msg}
-    </div>""", unsafe_allow_html=True)
+alerts_sub_slot = st.empty()
+alerts_slot = st.empty()
 
 # ── Live update loop ──────────────────────────────────────────
 while True:
@@ -441,7 +526,7 @@ while True:
 
     # ── Cat Identification (most recent visit) ────────────────
     with state["lock"]:
-        visits = list(state["visits_buf"])
+        visits = dedupe_visits(list(state["visits_buf"]))
 
     cat_colors = {1: "#7C6BB5", 2: "#E88FB4", 0: "#9E9E9E"}
     if visits:
@@ -517,5 +602,49 @@ while True:
         <div style="color:#7A7490;font-size:14px;padding:12px 0;">
           No visits recorded yet in this session.
         </div>""", unsafe_allow_html=True)
+
+    # ── Health Trends (from real visits) ───────────────────────
+    n_visits = len(visits)
+    health_sub_slot.markdown(
+        f'<div class="section-sub">14-day view · {n_visits} visit(s) this MQTT session (live)</div>',
+        unsafe_allow_html=True,
+    )
+    trends_df = build_daily_trends_from_visits(visits)
+    cw, cv = health_charts_slot.columns(2)
+    with cw:
+        st.markdown("**Daily Average Cat Weight (g)**")
+        w_chart = trends_df.set_index("Date")[["Wesley (g)", "Pupu (g)"]].replace(0, np.nan)
+        if w_chart.notna().any().any():
+            st.line_chart(w_chart, color=["#7C6BB5", "#E88FB4"],
+                          use_container_width=True, height=240)
+        else:
+            st.caption("No cat weight data yet — complete a visit on the scale.")
+    with cv:
+        st.markdown("**Daily Visit Count**")
+        st.line_chart(trends_df.set_index("Date")[["Wesley", "Pupu"]],
+                      color=["#7C6BB5", "#E88FB4"], use_container_width=True, height=240)
+    health_legend_slot.markdown("""
+    <div style="font-size:13px; color:#7A7490; margin-top:8px; display:flex; gap:18px; flex-wrap:wrap;">
+      <span style="display:flex; align-items:center; gap:7px;">
+        <span style="width:11px; height:11px; border-radius:999px; background:#7C6BB5;"></span>
+        <span style="color:#2A2440;">Wesley</span></span>
+      <span style="display:flex; align-items:center; gap:7px;">
+        <span style="width:11px; height:11px; border-radius:999px; background:#E88FB4;"></span>
+        <span style="color:#2A2440;">Pupu</span></span>
+    </div>""", unsafe_allow_html=True)
+
+    # ── Anomaly Alerts (from real visits) ────────────────────
+    alerts_sub_slot.markdown(
+        '<div class="section-sub">Rules applied to visits recorded this session (live)</div>',
+        unsafe_allow_html=True,
+    )
+    alert_lines = build_health_alerts_from_visits(visits)
+    alerts_html = ""
+    for icon, ts, msg in alert_lines:
+        alerts_html += f"""<div class="alert-row">
+          <span class="alert-icon">{icon}</span>
+          <b style="font-size:11px; color:#7A7490;">{ts}</b><br>{msg}
+        </div>"""
+    alerts_slot.markdown(alerts_html, unsafe_allow_html=True)
 
     time.sleep(0.5)

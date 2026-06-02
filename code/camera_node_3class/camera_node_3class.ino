@@ -6,26 +6,56 @@
  * All three classes distinguished by camera; Wesley displays as "Wesley" everywhere.
  */
 
+#include <catIdentifierBig.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include "esp_camera.h"
 #include "esp_heap_caps.h"
+#include "esp_now.h"
+#include <WiFi.h>
+#include "esp_wifi.h"
 
-// Override weak ei_calloc: route all EI memory to PSRAM to avoid DRAM exhaustion.
-extern "C" void* ei_calloc(size_t nitems, size_t size) {
+// Override EI weak ei_calloc — must use C++ linkage (not extern "C"); route to PSRAM.
+__attribute__((weak)) void* ei_calloc(size_t nitems, size_t size) {
     void* p = heap_caps_calloc(nitems, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!p) p = heap_caps_calloc(nitems, size, MALLOC_CAP_DEFAULT);
     return p;
 }
 
-// ★ Replace with the actual header name of your 3-class model library
-#include <catIdentifierBig.h>
-#include "edge-impulse-sdk/dsp/image/image.hpp"
-#include "esp_camera.h"
-#include "esp_now.h"
-#include <WiFi.h>
-#include "esp_wifi.h"
-
 // ── WiFi ─────────────────────────────────────────────────────
 const char* WIFI_SSID = "MengqiPhone";
 const char* WIFI_PASS = "gaoxiangshibenben";
+// If camera WiFi fails: set this to weight_node serial "[WiFi] Connected! ... Ch=?"
+#ifndef WIFI_FALLBACK_CHANNEL
+#define WIFI_FALLBACK_CHANNEL 6
+#endif
+
+static void wifiScanForSsid(const char* ssid) {
+    int n = WiFi.scanNetworks(false, true);
+    Serial.printf("[WiFi] Scan: %d networks", n);
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) == ssid) {
+            found = true;
+            Serial.printf(" | \"%s\" Ch=%d RSSI=%d", ssid, WiFi.channel(i), WiFi.RSSI(i));
+        }
+    }
+    Serial.println(found ? "" : " | hotspot NOT seen (2.4GHz? hotspot on?)");
+    WiFi.scanDelete();
+}
+
+static bool wifiConnectStation(const char* ssid, const char* pass, int tries) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.begin(ssid, pass);
+    Serial.printf("[WiFi] Connecting to \"%s\"", ssid);
+    for (int i = 0; i < tries && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500);
+        Serial.print(".");
+    }
+    return WiFi.status() == WL_CONNECTED;
+}
 
 // ── PIR ──────────────────────────────────────────────────────
 #define PIR_PIN          2        // D1 (GPIO2)
@@ -176,17 +206,27 @@ void setup() {
     lastPirState = digitalRead(PIR_PIN);
     Serial.println("[PIR] Ready");
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("[WiFi] Connecting");
-    for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
-        delay(500); Serial.print(".");
+    // WiFi: sync ESP-NOW channel with weight_node (not for MQTT). Both must use same Ch.
+    const int wifiTries = 60;  // 30 s
+    bool wifiOk = wifiConnectStation(WIFI_SSID, WIFI_PASS, wifiTries);
+    if (!wifiOk) {
+        Serial.println("\n[WiFi] Retry once...");
+        wifiOk = wifiConnectStation(WIFI_SSID, WIFI_PASS, wifiTries);
     }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\n[WiFi] Ch=%d\n", WiFi.channel());
+    if (wifiOk) {
+        Serial.printf("\n[WiFi] OK  IP=%s  Ch=%d  (weight must show same Ch)\n",
+                      WiFi.localIP().toString().c_str(), WiFi.channel());
     } else {
-        esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
-        Serial.println("\n[WiFi] FAILED, using Ch=6");
+        wl_status_t st = WiFi.status();
+        Serial.printf("\n[WiFi] FAILED (status=%d", (int)st);
+        if (st == WL_NO_SSID_AVAIL) Serial.print(", NO_SSID");
+        else if (st == WL_CONNECT_FAILED) Serial.print(", AUTH_FAIL");
+        else if (st == WL_DISCONNECTED) Serial.print(", DISCONNECTED");
+        Serial.println(")");
+        wifiScanForSsid(WIFI_SSID);
+        esp_wifi_set_channel(WIFI_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+        Serial.printf("[WiFi] ESP-NOW fallback Ch=%d — set WIFI_FALLBACK_CHANNEL to weight Ch, or fix hotspot\n",
+                      WIFI_FALLBACK_CHANNEL);
     }
 
     cam_ok = initCamera();
