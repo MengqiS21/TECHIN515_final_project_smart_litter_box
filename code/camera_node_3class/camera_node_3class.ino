@@ -29,18 +29,24 @@ const char* WIFI_PASS = "gaoxiangshibenben";
 #define WIFI_FALLBACK_CHANNEL 6
 #endif
 
-static void wifiScanForSsid(const char* ssid) {
+// Returns hotspot channel if seen, else 0.
+static int wifiScanForSsid(const char* ssid) {
     int n = WiFi.scanNetworks(false, true);
     Serial.printf("[WiFi] Scan: %d networks", n);
-    bool found = false;
+    int ch = 0;
+    int bestRssi = -999;
     for (int i = 0; i < n; i++) {
         if (WiFi.SSID(i) == ssid) {
-            found = true;
+            if (WiFi.RSSI(i) > bestRssi) {
+                bestRssi = WiFi.RSSI(i);
+                ch = WiFi.channel(i);
+            }
             Serial.printf(" | \"%s\" Ch=%d RSSI=%d", ssid, WiFi.channel(i), WiFi.RSSI(i));
         }
     }
-    Serial.println(found ? "" : " | hotspot NOT seen (2.4GHz? hotspot on?)");
+    Serial.println(ch ? "" : " | hotspot NOT seen (2.4GHz? hotspot on?)");
     WiFi.scanDelete();
+    return ch;
 }
 
 static bool wifiConnectStation(const char* ssid, const char* pass, int tries) {
@@ -223,10 +229,14 @@ void setup() {
         else if (st == WL_CONNECT_FAILED) Serial.print(", AUTH_FAIL");
         else if (st == WL_DISCONNECTED) Serial.print(", DISCONNECTED");
         Serial.println(")");
-        wifiScanForSsid(WIFI_SSID);
-        esp_wifi_set_channel(WIFI_FALLBACK_CHANNEL, WIFI_SECOND_CHAN_NONE);
-        Serial.printf("[WiFi] ESP-NOW fallback Ch=%d — set WIFI_FALLBACK_CHANNEL to weight Ch, or fix hotspot\n",
-                      WIFI_FALLBACK_CHANNEL);
+        int scanCh = wifiScanForSsid(WIFI_SSID);
+        int fallbackCh = scanCh ? scanCh : WIFI_FALLBACK_CHANNEL;
+        esp_wifi_set_channel(fallbackCh, WIFI_SECOND_CHAN_NONE);
+        Serial.printf("[WiFi] ESP-NOW fallback Ch=%d — must match weight_node Ch (see weight serial)\n",
+                      fallbackCh);
+        if (!scanCh) {
+            Serial.println("[WiFi] Tip: iPhone → Settings → Personal Hotspot → Maximize Compatibility ON");
+        }
     }
 
     cam_ok = initCamera();
@@ -249,8 +259,17 @@ void setup() {
 
 // ── Loop ──────────────────────────────────────────────────────
 void loop() {
-    int cur = digitalRead(PIR_PIN);
+    static unsigned long lastWifiRetryMs = 0;
     unsigned long now = millis();
+    if (WiFi.status() != WL_CONNECTED && now - lastWifiRetryMs > 30000) {
+        lastWifiRetryMs = now;
+        Serial.println("[WiFi] Retrying...");
+        if (wifiConnectStation(WIFI_SSID, WIFI_PASS, 40)) {
+            Serial.printf("[WiFi] OK  Ch=%d\n", WiFi.channel());
+        }
+    }
+
+    int cur = digitalRead(PIR_PIN);
 
     if (cur == HIGH && lastPirState == LOW) {
         if (now - lastTriggerTime > PIR_COOLDOWN_MS) {

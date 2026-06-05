@@ -70,21 +70,23 @@ st.markdown("""
 # ── Shared state (survives Streamlit reruns) ──────────────────
 MAX_POINTS = 60
 
-@st.cache_resource
+_APP_STATE = {
+    "connected":       False,
+    "mqtt_error":      "",
+    "weight_buf":      deque(maxlen=MAX_POINTS),
+    "time_buf":        deque(maxlen=MAX_POINTS),
+    "visits_buf":      deque(maxlen=50),
+    "visit_payloads":  set(),
+    "mqtt_running":    False,
+    "lock":            threading.Lock(),
+    "stop_event":      threading.Event(),
+    "mqtt_client":     None,
+    "tare_baseline_g": None,
+}
+
+
 def get_state():
-    return {
-        "connected":       False,
-        "mqtt_error":      "",
-        "weight_buf":      deque(maxlen=MAX_POINTS),
-        "time_buf":        deque(maxlen=MAX_POINTS),
-        "visits_buf":      deque(maxlen=50),   # real visit records from litterbox/visits
-        "visit_payloads":  set(),            # raw JSON dedup (multi MQTT thread guard)
-        "mqtt_running":    False,
-        "lock":            threading.Lock(),
-        "stop_event":      threading.Event(),
-        "mqtt_client":     None,
-        "tare_baseline_g": None,
-    }
+    return _APP_STATE
 
 
 def dedupe_visits(visits):
@@ -108,6 +110,12 @@ def dedupe_visits(visits):
 # ─────────────────────────────────────────────────────────────
 #  MQTT background reader
 # ─────────────────────────────────────────────────────────────
+def _mqtt_ok(rc) -> bool:
+    if hasattr(rc, "is_failure"):
+        return not rc.is_failure
+    return rc == 0
+
+
 def mqtt_reader(broker: str, port: int = 1883):
     state = get_state()
     try:
@@ -118,9 +126,9 @@ def mqtt_reader(broker: str, port: int = 1883):
         return
 
     def on_connect(client, userdata, flags, rc, props=None):
-        if rc == 0:
-            client.subscribe("litterbox/weight")
-            client.subscribe("litterbox/visits")
+        if _mqtt_ok(rc):
+            client.subscribe("litterbox/weight", qos=0)
+            client.subscribe("litterbox/visits", qos=1)
             with state["lock"]:
                 state["connected"]  = True
                 state["mqtt_error"] = ""
@@ -140,6 +148,7 @@ def mqtt_reader(broker: str, port: int = 1883):
             try:
                 value = float(payload)
                 with state["lock"]:
+                    state["connected"] = True
                     state["weight_buf"].append(value)
                     state["time_buf"].append(datetime.now())
             except ValueError:
@@ -152,6 +161,7 @@ def mqtt_reader(broker: str, port: int = 1883):
                 record["_time"] = now.strftime("%H:%M:%S")
                 record["_received_at"] = now
                 with state["lock"]:
+                    state["connected"] = True
                     if payload in state["visit_payloads"]:
                         return
                     state["visit_payloads"].add(payload)
@@ -378,29 +388,30 @@ with st.sidebar:
         state = get_state()
         state["stop_event"].set()
         with state["lock"]:
+            mc = state.get("mqtt_client")
             state["connected"]       = False
             state["mqtt_running"]    = False
             state["tare_baseline_g"] = None
             state["visits_buf"].clear()
             state["visit_payloads"].clear()
+        if mc is not None:
+            try:
+                mc.loop_stop()
+                mc.disconnect()
+            except Exception:
+                pass
+        time.sleep(0.3)
+        state["stop_event"].clear()
 
-    state = get_state()
-    with state["lock"]:
-        is_connected = state["connected"]
-        err_msg      = state["mqtt_error"]
-
-    if is_connected:
-        st.markdown('<span class="dot-green">●</span> Connected via MQTT', unsafe_allow_html=True)
-        if st.button("⚖️ Tare (Zero)", use_container_width=True):
-            with state["lock"]:
-                mc = state["mqtt_client"]
-            if mc:
-                mc.publish("litterbox/cmd", "tare")
-                st.toast("Tare command sent — scale zeroed!", icon="⚖️")
-    else:
-        st.markdown('<span class="dot-red">●</span> Disconnected', unsafe_allow_html=True)
-        if err_msg:
-            st.caption(err_msg)
+    # Status updates in the live loop below (while True freezes this static block)
+    conn_status_slot = st.empty()
+    if st.button("⚖️ Tare (Zero)", use_container_width=True, key="tare_mqtt"):
+        state = get_state()
+        with state["lock"]:
+            mc = state.get("mqtt_client")
+        if mc:
+            mc.publish("litterbox/cmd", "tare")
+            st.toast("Tare command sent — scale zeroed!", icon="⚖️")
 
     st.divider()
     st.markdown("**Live weight display**")
@@ -478,6 +489,28 @@ while True:
         weights   = list(state["weight_buf"])
         times     = list(state["time_buf"])
         connected = state["connected"]
+        err_msg   = state["mqtt_error"]
+        n_visits  = len(state["visits_buf"])
+        mc        = state.get("mqtt_client")
+
+    mqtt_live = connected or len(weights) > 0 or n_visits > 0
+    if mc is not None:
+        try:
+            mqtt_live = mqtt_live or mc.is_connected()
+        except Exception:
+            pass
+    if mqtt_live:
+        conn_status_slot.markdown(
+            f'<span class="dot-green">●</span> Connected via MQTT · '
+            f'{n_visits} visit(s) received',
+            unsafe_allow_html=True,
+        )
+    else:
+        hint = f"<br><span style='font-size:12px;color:#7A7490;'>{err_msg}</span>" if err_msg else ""
+        conn_status_slot.markdown(
+            f'<span class="dot-red">●</span> Disconnected{hint}',
+            unsafe_allow_html=True,
+        )
 
     if weights:
         raw_g      = float(weights[-1])
@@ -508,7 +541,7 @@ while True:
           <span class="stat-pill"><span class="stat-label">Readings</span><span class="stat-val">{len(nets)}</span></span>
         </div>""", unsafe_allow_html=True)
     else:
-        if connected:
+        if mqtt_live:
             weight_num_slot.markdown("""
             <div style="margin:12px 0; color:#7A7490; font-size:16px;">
               ⏳ Waiting for first reading…
@@ -518,8 +551,8 @@ while True:
             <div style="margin:12px 0; padding:14px 20px; background:#FFF7ED;
                         border-left:4px solid #F5A623; border-radius:0 12px 12px 0;
                         color:#92400E; font-size:15px;">
-              📡 Not connected. Click <b>Connect</b> and make sure Mosquitto is running
-              on this Mac and the Weight Node is on the same WiFi.
+              📡 Not connected. Click <b>Connect</b> — broker should be
+              <b>broker.hivemq.com</b> (same as weight_node). Mac needs internet.
             </div>""", unsafe_allow_html=True)
             chart_slot.empty()
             stats_slot.empty()

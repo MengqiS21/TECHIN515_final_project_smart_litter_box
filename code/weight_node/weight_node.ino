@@ -250,9 +250,9 @@ void connectMQTT() {
 }
 
 // Publish to MQTT and also echo to serial (for debugging)
-void publish(const char* topic, const String& payload) {
+void publish(const char* topic, const String& payload, bool retain = false) {
   Serial.printf("%s:%s\n", topic, payload.c_str());
-  if (mqtt.connected()) mqtt.publish(topic, payload.c_str());
+  if (mqtt.connected()) mqtt.publish(topic, payload.c_str(), retain);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -286,7 +286,8 @@ void logVisit(VisitRecord& v) {
     names[fid], fid, method, conf, dur_s, cat_w, excrement_g,
     v.entry_ms, v.exit_ms);
 
-  publish(TOPIC_VISITS, String(buf));
+  // retain=true so Streamlit gets last visit on subscribe/reconnect
+  publish(TOPIC_VISITS, String(buf), true);
 }
 
 // ─────────────────────────────────────────────────────────────
